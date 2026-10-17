@@ -1,0 +1,48 @@
+; nvment9x.inf
+; Windows 95 / 98 / Me Installation File for the NVMe Storage Controller Driver
+;
+; nvme2k by DominBear (Dominik Behr), https://github.com/techomancer/nvme2k
+; NVMENT by ages2001, based on nvme2k
+; Copyright (c) 2025-2026 Dominik Behr, 2026 ages2001
+
+[Version]
+Signature="$CHICAGO$"
+Class=SCSIAdapter
+ClassGUID={4D36E97B-E325-11CE-BFC1-08002BE10318}
+Provider=%ProviderString%
+DriverVer=10/12/2026,3.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,
+
+[SourceDisksFiles]
+nvment9x.mpd = 1
+
+[Manufacturer]
+%VendorString%=NVMe_Models
+
+[NVMe_Models]
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\CC_010802
+
+[NVMe_Inst]
+CopyFiles = NVMe_CopyFiles
+AddReg = IOS, NVMe_AddReg_9x
+
+[NVMe_CopyFiles]
+nvment9x.mpd
+
+[IOS]
+HKR,,DevLoader,,*IOS
+HKR,,DontLoadIfConflict,,"Y"
+
+[NVMe_AddReg_9x]
+HKR,,PortDriver,,nvment9x.mpd
+
+[Strings]
+ProviderString = "ages2001"
+VendorString = "Standard NVM Express Controller"
+NVMe.DeviceDesc = "nvment9x NVMe Storage Controller"
+DiskName = "nvment9x NVMe Storage Controller Installation Disk"

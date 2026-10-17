@@ -1,0 +1,11 @@
+-machine:i386
+-align:0x200
+-subsystem:native,4.00
+-debug:partial
+-base:0x10000
+-entry:DriverEntry
+-out:nvment9x.mpd
+-map:nvment9x.map
+-export:DriverEntry
+nvmemain.obj nvmecmd.obj nvmesatl.obj nvmeutil.obj nvmecpl.obj C:\DDK\BLOCK\LIB\scsiport.lib libc.lib
+nvment9x.res

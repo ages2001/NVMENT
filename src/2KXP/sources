@@ -1,0 +1,27 @@
+TARGETNAME=nvment
+TARGETPATH=obj
+TARGETTYPE=MINIPORT
+
+# Shared sources live one level up (src\); _WIN32_WINNT >= 0x500 = 2000/XP/2003
+INCLUDES=..
+
+TARGETLIBS=$(DDK_LIB_PATH)\scsiport.lib \
+           $(DDK_LIB_PATH)\ntoskrnl.lib \
+           $(CRT_LIB_PATH)\libcntpr.lib
+
+MSC_WARNING_LEVEL=/W3 /WX
+
+!IF $(ALPHA) || $(IA64) || $(AXP64)
+DRIVER_ALIGNMENT=0x2000
+!ELSE
+DRIVER_ALIGNMENT=0x1000
+!ENDIF
+
+LINKER_FLAGS=/MAP
+
+SOURCES=..\nvmemain.c \
+        ..\nvmecpl.c  \
+        ..\nvmecmd.c  \
+        ..\nvmesatl.c \
+        ..\nvmeutil.c \
+        ..\nvment.rc

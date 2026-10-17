@@ -1,0 +1,54 @@
+//
+// nvment.rc - version resource of nvment.sys / nvment9x.mpd
+//
+// NVMENT is based on nvme2k by Dominik Behr (DominBear)
+//
+
+#include <winver.h>
+
+#define NVMENT_VER_NUM              3,0,0,0
+#define NVMENT_VER_STR              "3.0.0.0"
+
+#ifdef NVMENT_W9X
+#define NVMENT_FILE_STR             "nvment9x.mpd"
+#define NVMENT_DESCRIPTION_STR      "nvment9x NVMe Storage Controller Miniport Driver"
+#define NVMENT_FILEOS               VOS_DOS_WINDOWS32
+#else
+#define NVMENT_FILE_STR             "nvment.sys"
+#define NVMENT_DESCRIPTION_STR      "nvment NVMe Storage Controller Miniport Driver"
+#define NVMENT_FILEOS               VOS_NT_WINDOWS32
+#endif
+
+#ifdef RC_INVOKED
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     NVMENT_VER_NUM
+PRODUCTVERSION  NVMENT_VER_NUM
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          NVMENT_FILEOS
+FILETYPE        VFT_DRV
+FILESUBTYPE     VFT2_DRV_SYSTEM
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "ages2001"
+            VALUE "FileDescription",  NVMENT_DESCRIPTION_STR
+            VALUE "FileVersion",      NVMENT_VER_STR
+            VALUE "InternalName",     NVMENT_FILE_STR
+            VALUE "LegalCopyright",   "Copyright (C) 2025-2026 Dominik Behr (nvme2k), 2026 ages2001 (NVMENT)"
+            VALUE "OriginalFilename", NVMENT_FILE_STR
+            VALUE "ProductName",      "NVMENT"
+            VALUE "ProductVersion",   NVMENT_VER_STR
+            VALUE "Comments",         "Based on nvme2k (https://github.com/techomancer/nvme2k)"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END
+
+#endif

@@ -1,0 +1,4 @@
+LIBRARY nvment.sys
+
+EXPORTS
+    DriverEntry

@@ -1,0 +1,175 @@
+NVMENT 3.0.0.0 - test results (QEMU 8.2, NVMe 1.4 controller "nvme")
+
+Builds tested
+- bin\2KXP\i386\nvment.sys, bin\2KXP\amd64\nvment.sys, bin\NT\nvment.sys
+  and bin\9X\nvment9x.mpd were built from these sources with MinGW-w64
+  (GCC 13; -mrtd for x86) against import libraries made from the
+  targets' own SCSIPORT.SYS / NTOSKRNL.EXE (SCSIPORT.PDR's NT 4.0
+  interface for 9x). Every binary carries the 3.0.0.0 version resource
+  (OriginalFilename nvment.sys / nvment9x.mpd).
+- The DDK projects (src\2KXP, src\NT, src\9X) build the same sources;
+  they were not run here.
+
+Windows 2000 (5.0.2195), system disk on AHCI with AHCINT, NVMe data disk
+- Feature test (featst: SCSI pass-through and miniport IOCTLs): READ
+  CAPACITY(16) LBPME, VPD 00h/B0h/B1h/B2h, LOG SENSE 00h (00 0D 11 2F),
+  0Dh (temperature), 11h (percentage used), 2Fh (ASC, temperature),
+  WRITE(16), UNMAP (the blocks read back as zeros), UNMAP beyond the end
+  (CHECK CONDITION, ILLEGAL REQUEST / 21h), TRIM_MODE_ON, an ordinary
+  write is written, a pattern write becomes a deallocate, TRIM_MODE_OFF,
+  the pattern is then written as data: all passed.
+- UNMAP beyond the end failed before with an I/O error (1117): ScsiPort
+  turned auto-sense off for that pass-through request and the sense data
+  was lost. The driver now keeps it for the REQUEST SENSE that follows.
+- trimnt on a FAT volume of 256 MB (QEMU discard=unmap, image with 55 MB
+  of stale blocks): "Scsi1: NVMENT TRIM mode on", 247 MB of free space
+  filled and deallocated, files deleted; the image went from 63.7 MB to
+  10.4 MB allocated, the files on the volume compare (sumtool) and CHKDSK
+  finds no problem.
+- SRB_FUNCTION_SHUTDOWN at system shutdown: shutdown notification
+  (CC.SHN) sent, controller shut down.
+- Release build (bin\ as shipped) on Windows 2000 next to AHCINT, IDENT
+  and MMCSDNT data disks: featst RESULT OK fails=0, trimnt (image from
+  63.7 MB to 17 MB allocated after the feature test), sumtool FILES 5
+  ERRORS 0, CHKDSK clean. Windows 95 with the release nvment9x.mpd:
+  sumtool FILES 5 ERRORS 0, w95io 0 errors.
+
+Windows 95, nvment9x.mpd
+- Installed through Device Manager (driver from disk, nvment9x.inf);
+  nvment9x.mpd loads from IOSUBSYS (Fast Polling) and finds the
+  controller and its namespace.
+- FAT16 data disk on NVMe: the files on it compare (sumtool); w95io 16 MB
+  (sequential 256 KB, random 4 KB and 32 KB writes and reads, final
+  verify): 0 errors.
+- SeaBIOS also served the NVMe disk through INT 13h; Windows 95 then
+  showed it a second time in MS-DOS compatibility mode (a drive that
+  hangs when accessed), as with AHCINT and MMCSDNT (see README, Known
+  Limitations).
+
+Not tested in 3.0.0.0: APST=1 (QEMU's controller has no APST), real
+hardware.
+
+-----------------------------------------------------------------------
+nvme2k 1.5.0.0 - test results (QEMU 8.2, NVMe 1.4 controller "nvme")
+
+Builds tested
+- bin\NT\nvme2k.sys (NT 3.1 - 4.0) was built from these sources with
+  i686 MinGW (GCC 13, -mrtd = stdcall like the DDK's /Gz) against an
+  import library made from NT 3.1's own SCSIPORT.SYS; it imports nothing
+  NT 3.1 lacks.
+- bin\2KXP\i386 and bin\2KXP\amd64\nvme2k.sys were built with MinGW
+  (i686 / x86_64) against import libraries made from Windows 2000's and
+  XP x64's SCSIPORT.SYS and NTOSKRNL.EXE.
+- The DDK projects (nt4, w2k, WDM) build the same sources; they were not
+  run here.
+
+Test setup
+- QEMU 8.2.2. Two namespaces on one controller: NSID 1 with 512-byte
+  and NSID 2 with 4096-byte LBAs (FAT volumes on both).
+- Test environment only: SeaBIOS hangs NTDETECT when it maps a 4 KB
+  namespace, so for the data-disk tests a patched QEMU hid the
+  namespaces until the second controller enable (the driver's).
+  Booting from NVMe used an unpatched setup (one 512-byte namespace).
+- Load test: a CrystalDiskMark-like tool (no buffering, write-through,
+  overlapped I/O): 1 MB sequential write/read, 512 KB and 4 KB random
+  write/read, 4 KB at queue depth 32, then a full re-read. Every sector
+  carries its own number and a generation tag, so a misplaced, stale or
+  lost write is detected.
+- Feature test (nvtest, SCSI pass-through and miniport IOCTLs, on both
+  namespaces): INQUIRY, READ CAPACITY(10/16) with LBPME, READ(10/12),
+  FUA, read past the end (ILLEGAL REQUEST / 21h), VERIFY(10/16),
+  SYNCHRONIZE CACHE(10/16), REPORT LUNS (2 LUNs), MODE SENSE(10)
+  caching page (WCE, DPOFUA), MODE SELECT(10) write cache off -> MODE
+  SENSE shows it off -> on again, VPD B0 (block limits), START STOP UNIT
+  stop -> READ -> start, SMART through "SCSIDISK" (VERSION, IDENTIFY,
+  READ ATTRIBUTES), NVME2KDB QUERY_INFO / POWER_DOWN / read wakes the
+  controller / POWER_DOWN / POWER_UP / read.
+
+Windows NT 3.1 (SP0, Standard HAL, system disk on AHCI with AHCINT)
+- Driver load with NT 3.1's ScsiPort: the full-size structure is
+  refused (C0000059), the driver retries with the 40h-byte layout on the
+  ISA bus and finds the controller through ports CF8h/CFCh.
+- Fast Polling (default) and IRQ=1 (INTx, up to 16 commands queued):
+  feature test on both namespaces, load test on the 512-byte FAT volume,
+  chkdsk clean. NT 3.1's FAT driver does not mount the 4 KB volume (the
+  same as on AHCI); the 4 KB namespace works as a disk (feature test).
+- Installed with oemsetup.inf (Windows NT Setup - Add/Remove SCSI
+  Adapters - Other): miniport as boot driver, class driver key set from
+  Start = 3 to 0.
+- The miniport has to be a boot driver: with Start = 1 scsidisk (a boot
+  driver) has already looked for disks and the NVMe disks do not appear.
+- Found with the INF-installed driver (Tag 33): it loaded before AHCINT
+  (set up untagged by text-mode setup), the NVMe disks became the first
+  disks and boot.ini's multi() path pointed at the wrong disk - STOP 6B.
+  oemsetup.inf now sets no Tag; without it the boot and all tests pass.
+  On NT 4.0 the service gets a Tag from NT 4.0's own registry.inf
+  (34, after AHCINT's 33); the system boots and the tests pass.
+
+Windows NT 4.0 (SP6, system disk on AHCI with AHCINT)
+- UP HAL: feature test, load test and CRC32 file lists on both volumes,
+  chkdsk - no errors.
+- MPS HAL with 2 CPUs: the same; up to 15 commands queued. 4 KB random
+  I/O is slow on this QEMU setup with the MPS HAL - the same with AHCINT.
+- Installed with oemsetup.inf (Control Panel - SCSI Adapters - Have
+  Disk) from a floppy: boot driver, class driver key set from Start = 3
+  to 0, feature test after the reboot.
+- NT 4.0 and Windows 2000 return a failed pass-through command as an I/O
+  error (1117) instead of the CHECK CONDITION status; the driver's
+  sense data are not visible to the tool there.
+
+Windows 2000 (5.0.2195, UP ACPI HAL)
+- Installed through nvme2k.inf (UpdateDriverForPlugAndPlayDevices).
+- Data disks: feature test and load test on both namespaces, CRC32 list,
+  chkdsk - no errors.
+- Hibernation with the NVMe disks as data disks (system disk on AHCI):
+  ScsiStopAdapter, hibernation, resume through ScsiRestartAdapter; after
+  resume the feature test, a load test on the NVMe volume and the CRC32
+  lists of four other volumes, chkdsk - no errors.
+- System disk on NVMe (boot through SeaBIOS, multi() path):
+  boot, load test, and hibernation. The dump stack loads a second
+  instance in Fast Polling, which writes the hibernation file to the
+  NVMe disk; resume, CRC32 lists of four data volumes, chkdsk - no
+  errors. This run found the queue alignment problem fixed in 1.5.0.0:
+  the dump stack's DMA buffer started 20h bytes into a page, the admin
+  queues were not page-aligned and the controller stopped with CFS, so
+  hibernation was refused.
+- S3 (standby) does not come back under QEMU/SeaBIOS in this setup, also
+  without NVMe (see the AHCINT tests); the driver's stop was logged.
+
+Windows XP x64 (5.2.3790), text-mode setup with F6 (floppy_amd64)
+- NVMe disk as the only hard disk, setup CD on IDE: driver from the F6
+  floppy, partition, format, file copy, boot from NVMe into GUI-mode
+  setup, device installation (two unsigned-driver prompts) up to
+  Regional Options, no "Files Needed" prompt.
+- Found here: without Parameters\PnpInterface the x64 ScsiPort never
+  called HwFindAdapter ("Setup did not find any hard disk drives"); the
+  driver now creates the value. GUI-mode setup asked for
+  OemDir\amd64\nvme2k.sys with the main INF; the F6 disks now carry a
+  flat INF.
+
+Controllers without a disk
+- Windows 2000 hung at "Starting up" with an NVMe controller that has no
+  namespaces: the driver answered REPORT LUNS / INQUIRY for LUN 0 with a
+  disk of capacity FFFFFFFFh and every read with BUSY, so the class
+  driver retried forever. Now LunCount = 0 presents no LUN at all
+  (SELECTION_TIMEOUT), and a namespace with zero capacity answers NOT
+  READY. Checked: NT 3.1, NT 4.0 (UP) and Windows 2000 with an NVMe
+  controller without namespaces next to the system disk (Windows 2000
+  with an empty AHCI HBA too: desktop in 55 s), and with the driver
+  installed but no controller present (service fails with C00000C0, no
+  hang). The same check was done with AHCINT (see its TESTS.TXT).
+
+QEMU q35 machine (ICH9 AHCI, PCIe root complex), Windows NT 3.1
+- System disk on the ICH9 AHCI (AHCINT), NVMe controller with a 512-byte
+  namespace: Fast Polling, feature test, CRC list, 50 MB load test and
+  chkdsk on the NVMe volume - no errors. With a 4096-byte namespace
+  attached as well, the loader (NTLDR) stopped on q35 before any driver
+  was loaded: SeaBIOS presents the namespace as an INT 13h drive and the
+  loader's drive scan does not return. A firmware/loader matter, not seen
+  on the pc machine, where the same namespace was tested earlier.
+
+Not tested
+- Real hardware, Alpha AXP, the DDK builds, Windows XP x86 and Server
+  2003, NT 3.5/3.51 (expected to behave like NT 3.1/4.0).
+- NVMe power states other than 0 (QEMU reports NPSS = 0), namespaces
+  with metadata, controllers with MDTS = 0.

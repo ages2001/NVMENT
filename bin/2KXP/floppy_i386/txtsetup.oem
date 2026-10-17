@@ -1,0 +1,71 @@
+#
+# TXTSETUP.OEM - NVMENT NVMe Driver for Windows 2000/XP text-mode setup
+#
+# nvme2k by DominBear (Dominik Behr); NVMENT by ages2001, based on nvme2k
+#
+# This file is used during text-mode setup to install the NVMe driver
+# for boot from NVMe controllers.
+#
+
+[Disks]
+
+# <description> is a descriptive name for a disk, used when
+#   prompting for the disk
+# <tagfile> is a file whose presence allows setup to recognize
+#   that the disk is inserted.
+# <directory> is where the files are located on the disk.
+
+d1 = "NVMENT NVMe Driver Disk", \disk1, \
+
+
+[Defaults]
+
+# This section lists the default selection for the 'scsi' component.
+
+scsi = NVMENT
+
+
+[scsi]
+
+# <id> is the unique string for the option
+# <description> is a text string, presented to the user in a menu
+# <key_name> gives the name of the key to be created for the component in
+#   HKEY_LOCAL_MACHINE\ControlSet001\Services
+
+NVMENT = "NVMENT NVMe Storage Controller (ages2001)", NVMENT
+
+
+[HardwareIds.scsi.NVMENT]
+
+# This section lists the hardware IDs of devices that this driver supports.
+# NVMe devices use PCI class code 01/08/02:
+#   Class 01 = Mass Storage Controller
+#   Subclass 08 = Non-Volatile Memory controller
+#   Programming Interface 02 = NVM Express
+
+id = "PCI\CC_010802", "NVMENT"
+
+
+[Files.scsi.NVMENT]
+
+# <file_type> is one of driver, port, class, dll, hal, inf, or detect.
+# <source_disk> identifies where the file is to be copied from, and must
+#   match an entry in the [Disks] section.
+# <filename> is the name of the file.
+
+driver = d1, nvment.sys, NVMENT
+inf    = d1, nvment.inf
+
+
+[Config.scsi.NVMENT]
+
+# This section specifies values to be set in the registry for
+# this component option. <key_name> is relative to the services node
+# for this device; empty means the services node itself.
+
+value = "", Tag, REG_DWORD, 33
+value = "", Type, REG_DWORD, 1
+value = "", Start, REG_DWORD, 0
+value = "", Group, REG_SZ, "SCSI Miniport"
+value = "", ErrorControl, REG_DWORD, 1
+value = Parameters\PnpInterface, 5, REG_DWORD, 1
