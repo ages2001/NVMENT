@@ -6,10 +6,10 @@
 
 | | |
 |---|---|
-| **Version** | 3.0.0.0 |
+| **Version** | 3.1.0.0 |
 | **Operating systems** | Windows 95 / 98 / Me · Windows NT 3.1 / 3.50 / 3.51 / 4.0 · Windows 2000 / XP / Server 2003 (x86, Alpha) · Windows XP x64 / Server 2003 x64 |
-| **Hardware** | NVMe controllers (PCI class code `01-08-02`), NVMe 1.0 and later, up to 8 per system |
-| **Devices** | Up to 8 namespaces per controller, each a disk (512, 1024, 2048 and 4096-byte LBA formats) |
+| **Hardware** | NVMe controllers (PCI class code `01-08-02`), NVMe 1.0 and later, up to 32 per system |
+| **Devices** | Up to 32 namespaces per controller, each a disk (512, 1024, 2048 and 4096-byte LBA formats) |
 | **Binaries** | `nvment9x.mpd` (Windows 9x/Me) · `nvment.sys` (NT 3.1–4.0) · `nvment.sys` (2000/XP/2003, x86 and x64) |
 | **License** | 3-Clause BSD — see [License](#license) |
 
@@ -20,9 +20,11 @@
 - **TRIM** through Dataset Management (SCSI UNMAP), plus `tools\trimnt.exe` to deallocate the free space of a volume on systems that never send TRIM
 - **Health**: SMART through the `atapi.sys`-compatible "SCSIDISK" IOCTL, ATA PASS-THROUGH IDENTIFY/SMART, and LOG SENSE pages for temperature, wear and critical warnings
 - **Power management**: shutdown notification at system shutdown, hibernation and crash dumps on 2000/XP, power states for START STOP UNIT, autonomous power state transitions on request
+- **Up to 32 namespaces per controller and 32 controllers**; single namespaces can be left out with `OFF=`
 - **Robust**: controller reset and recovery after a hang, namespaces with large LBA formats, controllers without namespaces handled cleanly
 - **One source tree** for all targets, with the same SCSI translation layer and IOCTL conventions as AHCINT, IDENT and MMCSDNT
 
+- **Namespaces tab in Device Manager** (2000/XP/x64): check boxes to turn single namespaces off, without editing the registry
 ## Quick start
 
 | System | Files | How |
@@ -51,7 +53,8 @@ It seemed like a good idea at first.
 - **NVMe**
   - NVMe 1.0 and later; one admin queue and one I/O queue pair, PRP lists from a pool of 32 pages
   - Up to 2 MB per command (limited by the controller's MDTS)
-  - **Namespaces**: up to 8 active namespaces, each a LUN of target 0 (Identify CNS 02h on NVMe 1.1+ controllers, otherwise NSID 1..NN), with 512, 1024, 2048 and 4096-byte LBA formats
+  - **Namespaces**: up to 32 active namespaces (Identify CNS 02h on NVMe 1.1+ controllers, otherwise NSID 1..NN), with 512, 1024, 2048 and 4096-byte LBA formats; namespace n is LUN n % 8 of target n / 8, so the first eight keep target 0, LUNs 0–7 (NT 3.1–4.0 and Windows 9x scan LUNs 0–7 only)
+  - `OFF=` leaves single namespaces out (by NSID), optionally on one controller only
   - Volatile write cache control (Set/Get Features 06h), FUA, flush
   - Dataset Management (deallocate) for UNMAP and TRIM mode, NVMe Verify for VERIFY
   - Power states: power state 0 while running; START STOP UNIT and the POWER_DOWN IOCTL move the controller to its deepest non-operational state or shut it down; autonomous power state transitions (APST) with `APST=1`
@@ -60,7 +63,7 @@ It seemed like a good idea at first.
 
 - **SCSI translation**
   - INQUIRY with VPD pages `00h`, `80h` (serial number), `B0h` (block and unmap limits), `B1h` (non-rotating, form factor) and `B2h` (logical block provisioning)
-  - READ/WRITE(6/10/12/16), VERIFY(6/10/12/16), SYNCHRONIZE CACHE(10/16), READ CAPACITY(10/16) with LBPME, UNMAP, START STOP UNIT, REPORT LUNS, REQUEST SENSE, MODE SENSE/SELECT(6/10) caching page (WCE, DPOFUA)
+  - READ/WRITE(6/10/12/16), VERIFY(6/10/12/16), SYNCHRONIZE CACHE(10/16), READ CAPACITY(10/16) with LBPME (READ CAPACITY(10) of a namespace of 2 TB or more: see [Namespaces of 2 TB and more](#namespaces-of-2-tb-and-more)), UNMAP, START STOP UNIT, REPORT LUNS, REQUEST SENSE, MODE SENSE/SELECT(6/10) caching page (WCE, DPOFUA)
   - LOG SENSE pages `00h`, `0Dh` (temperature), `11h` (solid state media: percentage used) and `2Fh` (informational exceptions: ASC 5Dh on a critical warning)
   - SMART through the "SCSIDISK" `IOCTL_SCSI_MINIPORT` (as `atapi.sys`), ATA PASS-THROUGH(12/16) for IDENTIFY and SMART
   - NVMe status codes translated to sense data (NVM Express SCSI Translation Reference); sense data kept for REQUEST SENSE when ScsiPort turns auto-sense off
@@ -68,7 +71,7 @@ It seemed like a good idea at first.
   - **TRIM mode** for Windows versions that send no TRIM: with `tools\trimnt.exe` the free space of a volume is deallocated; see [TRIM mode and trimnt](#trim-mode-and-trimnt)
 
 - **Interrupt or Fast Polling**
-  - Interrupt (INTx) mode where the HAL routes PCI interrupts (NT 3.50 to XP x64)
+  - Interrupt (INTx) mode where the HAL routes PCI interrupts (NT 3.50 to XP x64); on NT 3.50–4.0 a line the HAL cannot translate (MPS HAL without an MP table entry) gives Fast Polling instead of a failed adapter
   - **Fast Polling**: completions polled in `HwStartIo`, no interrupt needed — the default on NT 3.1 and Windows 9x, with `IRQ=0`, and in the crash dump / hibernation stack
   - A 100 ms watchdog completes what a lost interrupt left behind and switches to Fast Polling for good after five such cases
 
@@ -113,6 +116,7 @@ It seemed like a good idea at first.
 | `src\nvment.h`, `src\nvme.h`, `src\scsiext.h` | Driver structures and limits, NVMe definitions, SCSI additions |
 | `src\nvment.rc` | Version resource (`nvment.sys` / `nvment9x.mpd`) |
 | `src\2KXP`, `src\NT`, `src\9X` | Build files per target |
+| `tools\portpage.c`, `tools\mkpp.sh` | The Device Manager page `nvmentpp.dll` for 2000/XP/x64 (see [Device Manager page](#device-manager-page)); the same source builds the page of AHCINT, IDENT, NVMENT and MMCSDNT |
 | `bin\` | Prebuilt binaries and install files |
 | `tools\trimnt.c` | TRIM of a volume's free space (all four sibling drivers) |
 
@@ -144,6 +148,8 @@ It seemed like a good idea at first.
 - Windows 9x and BIOS-served disks: an NVMe disk the BIOS also serves through INT 13h (an NVMe option ROM, SeaBIOS) can appear twice, once through nvment9x and once in MS-DOS compatibility mode (a drive that hangs when accessed), as with AHCINT and MMCSDNT; do not use the compatibility-mode drive
 - Windows before 7 sends no TRIM: deallocation happens through UNMAP pass-through or `trimnt` only
 - APST is off by default and was not tested on hardware (QEMU's controller has none)
+- Namespaces of 2 TB and more: Windows 9x, NT 3.1–4.0, 2000 and XP x86 address at most the first 2 TB; XP x64 and Server 2003 SP1 and later see the whole namespace. See [Namespaces of 2 TB and more](#namespaces-of-2-tb-and-more)
+- QUERY_INFO reports the NSID, block size and size of the first eight namespaces only (the `NVMENT_INFO` layout is unchanged)
 - Tested primarily in virtual machines (QEMU); nvme2k was also tested on Windows 2000 RC2 on Alpha. Reports from real hardware are welcome
 
 ## Building from source
@@ -198,6 +204,10 @@ Compile every `.c` file in `src\` with `-ffreestanding -fno-builtin`, `-mrtd` on
 // #define NVMENT_DBG_EXTRA           // now that is just excessive
 ```
 
+#### Device Manager page (2000/XP/x64)
+
+`tools\mkpp.sh` builds `nvmentpp.dll` (and the pages of the sibling drivers) from `tools\portpage.c` with MinGW-w64, x86 into `pp\i386` and x64 into `pp\amd64`. The DLL uses no C runtime: it imports only `kernel32`, `user32`, `advapi32`, `setupapi` and `comctl32` functions that Windows 2000 has.
+
 ## Installation
 
 ### Installation Media
@@ -232,6 +242,8 @@ tools\
 The F6 disks carry a flat copy of `nvment.inf` (no `i386\`/`amd64\` subdirectories): text-mode setup copies the driver and the INF flat into `%SystemRoot%\OemDir`, and GUI-mode setup installs the controller again from there — with the subdirectories it would ask for the file ("Files Needed").
 
 Every INF matches the NVMe class code `PCI\CC_010802`, so any NVMe controller is offered.
+
+Every `bin\2KXP` folder also holds `nvmentpp.dll`, the [Device Manager page](#device-manager-page): the x86 build in `2KXP\`, `i386\` and `floppy_i386\`, the x64 build in `amd64\` and `floppy_amd64\`. `nvment.inf` copies it into `System32` and registers it (`EnumPropPages32`); `txtsetup.oem` lists it as a `dll` so that it is on the F6 disk's way into `OemDir` as well. Without it the driver works as before, only the tab is missing.
 
 ### Installing
 
@@ -286,15 +298,29 @@ On the NT family the driver reads the ScsiPort argument string: the `REG_SZ` val
 | `IRQ=0` | No interrupt: every command is Fast Polling (any version) |
 | `IRQ=1` | Windows 9x, and NT 3.1 (no PCI slot information): connect the interrupt line from PCI configuration space |
 | `APST=1` | Autonomous power state transitions on (controllers that report APSTA) |
+| `OFF=list` | Namespaces the driver leaves out, by NSID, separated by commas: `OFF=3,4` hides namespaces 3 and 4 of every controller; a PCI location `bus.device.function:` in front (decimal, as Device Manager shows it) limits an item to one controller: `OFF=2.0.0:5`. At most 16 items. The remaining namespaces move up: the LUN numbering counts only the namespaces that are presented |
+| `RC16=1` / `RC16=0` | READ CAPACITY(10) reports `FFFFFFFFh` for a namespace of 2 TB or more (`RC16=1`, for a class driver or filter that then reads READ CAPACITY(16)), or `FFFFFFFEh` (`RC16=0`); the default depends on the Windows version, see [Namespaces of 2 TB and more](#namespaces-of-2-tb-and-more) |
 
 Several values are separated by spaces. The crash dump / hibernation instance is recognized by the `DUMP=` string ScsiPort passes to it.
+
+### Device Manager page
+
+On Windows 2000, XP and Server 2003 (x86 and x64) the controller's properties in Device Manager have a **Namespaces** tab (`nvmentpp.dll`):
+
+- The list shows the active namespaces of the controller by NSID (Identify CNS 02h through the `NvmeMini` pass-through; NSID 1 to NN on NVMe 1.0), each with its size and block size.
+- Clearing a check box turns that namespace off: the page writes an `OFF=` item with the controller's PCI location (`bus.device.function:item`) into `DriverParameters`; checking it again removes the item. An `OFF=` item without a location (for every controller) that this controller should no longer follow is replaced by items for each of the other NVMENT controllers, so they keep it. A namespace left out keeps its NSID; the presented ones move up, so the LUNs behind it change.
+- The box under the list shows the whole `DriverParameters` string, for all controllers; it can be edited directly (other values, items the list does not show), and the check boxes follow it.
+- **OK** or **Apply** stores the string. Device Manager then restarts the controller, which takes effect at once for a controller without the system disk, page file or hibernation file, or asks for a restart of the computer.
+- Writing the value needs administrator rights (it is under `HKLM`).
+
+NT 3.1–4.0 have no Device Manager: there `OFF=` goes into the registry by hand, as above. On Windows 9x/Me it goes into `AdapterSettings`.
 
 ### Build-time limits
 
 ```c
-#define NVMENT_MAX_LUNS                 8       // namespaces per controller
+#define NVMENT_MAX_LUNS                 32      // namespaces per controller (target n / 8, LUN n % 8)
 #define NVMENT_MAX_SG_PAGES             32      // PRP list page pool
-#define NVMENT_MAX_CONTROLLERS          8
+#define NVMENT_MAX_CONTROLLERS          32
 #define NVMENT_WATCHDOG_USEC            100000  // interrupt watchdog while commands are outstanding
 #define NVMENT_MISSED_IRQ_LIMIT         5       // lost interrupts before Fast Polling
 #define NVMENT_APST_MAX_LATENCY_US      100000  // APST: deepest state with an exit latency up to 100 ms
@@ -364,11 +390,21 @@ The NT build handles NT 3.1 at run time, so the same `nvment.sys` runs on NT 3.1
 - **DMA memory:** taken as EISA on buses without PCI slot information, so it is not limited to the first 16 MB.
 - **Interrupt:** Fast Polling by default, since a failed interrupt connection fails the adapter there; `IRQ=1` connects the INTx line.
 
+### Windows NT 3.50–4.0: interrupt check
+
+Before reporting the controller's interrupt line to ScsiPort, the NT build asks the HAL for a vector (`HalGetInterruptVector`, as ScsiPort will). An MPS HAL (`halmps.dll`) translates PCI interrupts through the MP table, and a modern BIOS often writes no entry there for devices behind a PCI-PCI bridge (where NVMe SSDs usually sit): the HAL then returns no vector, ScsiPort cannot connect the interrupt and fails the whole adapter, which with the system disk on it stops the boot with `0x7B INACCESSIBLE_BOOT_DEVICE` (AHCINT GitHub issue #2: NT 3.51 with `halmps.dll` on an X99 board). The driver then reports no interrupt and runs the controller with Fast Polling; the debug output says `no vector for IRQ n ... Fast Polling`. `IRQ=0` does the same unconditionally.
+
 ### Windows 2000/XP/x64 specifics
 
 - **PnP adapter:** the PCI bus driver enumerates the controller and ScsiPort starts NVMENT with its BAR and interrupt.
 - **Text-mode setup (F6):** `Parameters\PnpInterface\5` is created by `DriverEntry` when missing (see [Text-mode (F6) setup](#text-mode-f6-setup--windows-2000xpxp-x64server-2003)).
 - **Hibernation and crash dump:** the dump stack instance runs with Fast Polling and a small (16 KB) DMA area; its queues are aligned on the physical address, since the dump stack's DMA buffer does not start on a page boundary.
+
+### Namespaces of 2 TB and more
+
+A namespace whose last LBA is `FFFFFFFFh` or beyond does not fit READ CAPACITY(10). The SCSI answer is `FFFFFFFFh`, which tells the class driver to read READ CAPACITY(16). The disk class drivers of Server 2003 SP1 and XP x64 (and later) do; those of NT 3.1–4.0, Windows 9x, 2000 and XP x86 do not: they add one to the value in 32 bits and see a disk of 0 bytes. The driver therefore answers `FFFFFFFEh` (2 TB minus one block) where the class driver does not know READ CAPACITY(16): those systems see and use the first 2 TB, which is all they can address with READ(10)/WRITE(10) and an MBR anyway. READ CAPACITY(16) and 16-byte CDBs always give the whole namespace.
+
+The choice is made once at load time: the NT and 9x builds always clip; the 2000/XP x86 build asks `PsGetVersion` (Server 2003 with a service pack, or later, reads READ CAPACITY(16)); the x64 build never clips. `RC16=1` / `RC16=0` in the driver parameters override it. The same rule is used by AHCINT, IDENT and MMCSDNT.
 
 ### Memory Allocation
 
@@ -383,19 +419,33 @@ The NT build handles NT 3.1 at run time, so the same `nvment.sys` runs on NT 3.1
 I/O queue:
 Bit 15: non-tagged flag (1 = non-tagged, 0 = tagged)
 Bit 14: ordered flush flag (for ORDERED queue tags)
-Bits 8-10: LUN (namespace index)
+Bits 8-12: logical unit index (target * 8 + LUN)
 Bits 0-7: QueueTag (tagged) or sequence number (non-tagged)
 
-Admin queue:
-Bits 11-13: kind (1 synchronous/polled, 2 GET LOG PAGE for SMART,
-            3/4 user IDENTIFY / GET LOG PAGE)
-Bits 0-7: PRP slot or sequence number
-For a GET LOG PAGE admin command the PRP slot is added to the base CID,
-so the slot is not leaked when ScsiPort does not return the SRB (it does
-not for the SMART requests).
+Admin queue, commands that carry an SRB:
+Bits 15, 8-12, 0-7: as on the I/O queue
+Bit 13: kind (0 GET LOG PAGE for LOG SENSE / SAT / SMART,
+        1 IDENTIFY / GET LOG PAGE from the NVMENT IOCTL)
+Bit 14: always 0
+
+Admin queue, fixed IDs:
+FFFCh: synchronous (polled) command
+FFFDh / FFFEh: delete I/O CQ / SQ at shutdown
 ```
 
 ## Version history
+
+### 3.1.0.0 — 2026-10-19
+
+- Device Manager page (**Namespaces** tab, `nvmentpp.dll`) for 2000/XP/x64: namespaces turned off with check boxes instead of `OFF=` typed into the registry; installed by `nvment.inf` and the F6 disks.
+- Up to 32 namespaces per controller (8 before) and up to 32 controllers (8 before). Namespace n is LUN n % 8 of target n / 8, so the first eight keep their addresses; NT 3.1–4.0 and 9x, which scan only LUNs 0–7, see all of them. The Command ID carries a 5-bit logical unit index; synchronous admin commands use a fixed ID.
+- `OFF=` leaves single namespaces out (by NSID), optionally on one controller only (by its PCI location).
+- NT 3.50–4.0: an interrupt the HAL cannot translate (MPS HAL without an MP table entry for the controller) no longer fails the adapter (`0x7B` with the system disk on NVMe); the controller runs with Fast Polling (as AHCINT, GitHub issue #2).
+- Namespaces of 2 TB and more: READ CAPACITY(10) reported `FFFFFFFFh`, which the class drivers of NT 3.1–4.0, 9x, 2000 and XP x86 turned into a disk of 0 bytes; they now get `FFFFFFFEh` and see the first 2 TB. XP x64 and Server 2003 SP1 and later still get `FFFFFFFFh` and read the full size with READ CAPACITY(16). `RC16=0/1` overrides.
+- READ CAPACITY(16) with an allocation length below 32 bytes returned a data overrun; it now returns the requested part.
+- REPORT LUNS lists the namespaces of the addressed target.
+- Windows XP x64 / Server 2003 x64: the controller registers are read and written through ScsiPort's exported functions, as in the x86 build. The x64 build used inline accesses without a compiler barrier, so the compiler could move accesses to the queue entries in memory across them (found while looking into a shutdown hang reported on XP x64 with AHCINT; see `TESTS.TXT`).
+- A controller whose registers read all ones (powered off or removed) is no longer set up again, and the shutdown notification no longer waits for queued commands or the shutdown status of such a controller: requests fail at once instead of running into timeouts.
 
 ### 3.0.0.0 — 2026-10-12 (NVMENT)
 

@@ -6,7 +6,8 @@ TARGETTYPE=MINIPORT
 # shared sources live one level up (src\)
 INCLUDES=..;$(BASEDIR)\src\storage\inc
 
-TARGETLIBS=$(BASEDIR)\lib\*\$(DDKBUILDENV)\scsiport.lib
+TARGETLIBS=$(BASEDIR)\lib\*\$(DDKBUILDENV)\scsiport.lib \
+           $(BASEDIR)\lib\*\$(DDKBUILDENV)\hal.lib
 
 SOURCES=..\nvmemain.c \
         ..\nvmecpl.c  \

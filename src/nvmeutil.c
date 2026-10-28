@@ -972,6 +972,64 @@ BOOLEAN ArgPresent(IN PCHAR Args, IN PCHAR Key)
 }
 
 //
+// ParseNamespacesOff - OFF=item[,item...]: namespaces the driver leaves out.
+// item = [bus.device.function:]nsid, all decimal; with the PCI location (as
+// Device Manager shows it) the item applies to that controller only.
+//
+static PCHAR ParseDecimal(IN PCHAR P, OUT PULONG Value)
+{
+    ULONG v = 0;
+    PCHAR start = P;
+
+    while (*P >= '0' && *P <= '9') v = v * 10 + (ULONG)(*P++ - '0');
+    *Value = v;
+    return (P == start) ? NULL : P;
+}
+
+VOID ParseNamespacesOff(IN PHW_DEVICE_EXTENSION DevExt, IN PCHAR Args)
+{
+    ULONG i, j, n, v[4], count, colon;
+    PCHAR p;
+    CHAR a;
+    PCI_SLOT_NUMBER slot;
+
+    DevExt->NsOffCount = 0;
+    slot.u.AsULONG = DevExt->SlotNumber;
+    for (i = 0; Args != NULL && Args[i] != 0; i++) {
+        static const CHAR key[] = "OFF=";
+        for (j = 0; key[j] != 0; j++) {
+            a = Args[i + j];
+            if (a >= 'a' && a <= 'z') a = (CHAR)(a - 'a' + 'A');
+            if (a != key[j]) break;
+        }
+        if (key[j] != 0) continue;
+        p = &Args[i + j];
+        for (;;) {
+            count = 0;
+            colon = 0;
+            while (count < 4) {
+                p = ParseDecimal(p, &n);
+                if (p == NULL) break;
+                v[count++] = n;
+                if (*p == ':' && count == 3 && colon == 0) { colon = 3; p++; continue; }
+                if (*p == '.') { p++; continue; }
+                break;
+            }
+            if (p == NULL) break;
+            if (colon != 0 && (v[0] != DevExt->BusNumber || v[1] != slot.u.bits.DeviceNumber ||
+                               v[2] != slot.u.bits.FunctionNumber)) {
+                count = 0;          // another controller
+            }
+            if (count == colon + 1 && v[colon] != 0 && DevExt->NsOffCount < 16) {
+                DevExt->NsOff[DevExt->NsOffCount++] = v[colon];
+            }
+            if (*p != ',') break;
+            p++;
+        }
+    }
+}
+
+//
 // log2 - Calculate integer base-2 logarithm
 // Returns the highest bit set, e.g., log2(4096) = 12
 //

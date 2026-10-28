@@ -1,5 +1,56 @@
 NVMENT 3.0.0.0 - test results (QEMU 8.2, NVMe 1.4 controller "nvme")
 
+Additions to 3.1.0.0 (2026-10-26): 32 namespaces, OFF=, MPS interrupt
+check, namespaces of 2 TB and more, 32 controllers
+
+- Version number: this release is 3.1.0.0. The runs below were
+  made with the same sources numbered 3.0.1.0; the rebuilt binaries
+  differ from those only in the version resource and the version in
+  the driver's info IOCTL (compared by disassembly), and the 3.1.0.0
+  release build was booted again on Windows 2000.
+- 10 namespaces on one controller (namespace 9 and 10 on target 1, LUN 0
+  and 1): all listed on NT 4.0, Windows 2000 and XP x64 (release build,
+  GUI-mode setup).
+- OFF=: namespaces left out by NSID on Windows 2000; the remaining ones
+  are presented in order.
+- Namespaces of 2 TB and more: a 2 TB namespace on NT 4.0 and a 3 TB
+  namespace on Windows 2000 are seen as 2 TB minus one block instead of 0
+  bytes.
+- READ CAPACITY(16) with a 12-byte allocation length returned DATA OVERRUN;
+  it now returns the 12 bytes asked for.
+- Admin path with the new Command ID layout, Windows 2000, release build
+  (nvtest on two namespaces): INQUIRY, READ CAPACITY(10)/(16), READ
+  past the end (ILLEGAL REQUEST / 21h), VERIFY(10)/(16), SYNCHRONIZE
+  CACHE(10)/(16), REPORT LUNS (2 LUNs), MODE SENSE/SELECT caching page,
+  VPD B0h, START STOP UNIT, SMART VERSION / IDENTIFY / READ ATTRIBUTES
+  (GET LOG PAGE), QUERY_INFO: all passed (the MBR checks fail on a blank
+  second namespace, as expected).
+- Test environment only: as noted below, SeaBIOS hangs NTDETECT when it
+  maps a namespace with 4 KB blocks; the 4 KB namespace was left out of
+  these runs.
+- Release build on XP x64 (GUI-mode setup) next to the other three
+  drivers: shutdown powered off after 10 s.
+- Windows 9x: the 9x build was made from these sources but not run in
+  this round.
+- Device Manager page (nvmentpp.dll, Namespaces tab): namespaces found
+  through the NvmeMini pass-through (Identify CNS 02h and 00h) with size
+  and block size. Windows 2000 (x86 build, the image's service is still
+  called nvme2k, so a copy built for that name): namespace 2 left out
+  through the page's test entry, OFF=0.4.0:2 written, gone after the
+  restart, listed as off.
+- XP x64: the tab in GUI-mode setup on the AHCI-installed image, and an
+  F6 installation onto NVMe with the new floppy (nvmentpp.dll listed as
+  dll in txtsetup.oem): text-mode setup copied it into OemDir, GUI-mode
+  setup into System32 without asking for files, and the tab showed the
+  6 GB system namespace.
+- The page DLLs were built with MinGW-w64 (tools\mkpp.sh); the x86 and
+  x64 builds import only functions Windows 2000 exports (checked against
+  its DLLs). Text-mode setup rejected a first build listed in
+  txtsetup.oem ("not a valid Windows system image"): its PE checksum was
+  stale after the header was edited. mkpp.sh now writes the checksum.
+  Not tested: the F6 path on Windows 2000 (only XP x64), Have Disk with
+  the main INF (the F6 copies differ only in their source paths).
+
 Builds tested
 - bin\2KXP\i386\nvment.sys, bin\2KXP\amd64\nvment.sys, bin\NT\nvment.sys
   and bin\9X\nvment9x.mpd were built from these sources with MinGW-w64
@@ -173,3 +224,34 @@ Not tested
   2003, NT 3.5/3.51 (expected to behave like NT 3.1/4.0).
 - NVMe power states other than 0 (QEMU reports NPSS = 0), namespaces
   with metadata, controllers with MDTS = 0.
+
+Shutdown on Windows XP x64 (3.1.0.0)
+Looking into a hang at shutdown reported on XP x64 with AHCINT 1.5.0.0
+(XP x86 and 2000 not affected on the same machine, as reported). Not
+reproduced in QEMU in any of these runs, so the change in this release
+is the one x64-only difference found in the code, not a confirmed fix.
+- XP x64 SP1, F6 installation with all four drivers on one floppy
+  (system disk on AHCI through AHCINT, an NVMe disk through NVMENT, an
+  SD card on a PCI SDHCI through MMCSDNT, PIIX3 disk and CD through
+  IDENT), GUI-mode setup at Regional Options, debug builds: shutdown
+  from the setup command prompt through NtShutdownSystem (power off) and
+  restart: powered off after 5-10 s, restart back at the driver load
+  after 15 s. Repeated with 4 CPUs, with 2 GB of the 3 GB RAM above
+  4 GB, with a SATA DVD on an AHCI port, with a PCI power management
+  capability added to QEMU's AHCI (which has none; Windows did not take
+  the HBA to D3 at shutdown), and with a QEMU patch that delays every
+  NCQ command after STANDBY IMMEDIATE by 8 s (a disk spinning up): no
+  hang. A traced build showed the order on XP x64: the last writes and
+  SYNCHRONIZE CACHE / FLUSH, then SRB_FUNCTION_SHUTDOWN (flush, standby),
+  and no request after it.
+- Windows 2000 SP4, system on AHCI (AHCINT), NVMe data disk (NVMENT),
+  PIIX3 disk (IDENT): a file copy and a registry change, then shutdown
+  through ExitWindowsEx: powered off, also with the spin-up delay.
+- The x64 builds of AHCINT and NVMENT used srb.h's inline register
+  accesses (plain volatile, no compiler barrier) where the x86 builds
+  call ScsiPort's functions; they now import ScsiPortReadRegisterUlong
+  and ScsiPortWriteRegisterUlong as well (MMCSDNT and IDENT already
+  did). The release builds of this version ran the XP x64 shutdown runs
+  above again (also with RAM above 4 GB): powered off after 5 s.
+- The new check for registers reading all ones (a powered-off or removed
+  controller) was not triggered in any of these runs.

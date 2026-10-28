@@ -55,6 +55,7 @@ id = "PCI\CC_010802", "NVMENT"
 
 driver = d1, nvment.sys, NVMENT
 inf    = d1, nvment.inf
+dll    = d1, nvmentpp.dll
 
 
 [Config.scsi.NVMENT]

@@ -6,8 +6,8 @@
 
 #include <winver.h>
 
-#define NVMENT_VER_NUM              3,0,0,0
-#define NVMENT_VER_STR              "3.0.0.0"
+#define NVMENT_VER_NUM              3,1,0,0
+#define NVMENT_VER_STR              "3.1.0.0"
 
 #ifdef NVMENT_W9X
 #define NVMENT_FILE_STR             "nvment9x.mpd"

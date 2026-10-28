@@ -418,6 +418,14 @@ BOOLEAN NvmeIdentifyNamespace(IN PHW_DEVICE_EXTENSION DevExt)
     }
 
     for (i = 0; i < count && DevExt->LunCount < NVMENT_MAX_LUNS; i++) {
+        ULONG k;
+        for (k = 0; k < DevExt->NsOffCount && DevExt->NsOff[k] != nsids[i]; k++) ;
+        if (k < DevExt->NsOffCount) {
+#ifdef NVMENT_DBG
+            ScsiDebugPrint(0, "NVMENT: NSID %u turned off (OFF=)\n", nsids[i]);
+#endif
+            continue;
+        }
         NvmeAddNamespace(DevExt, nsids[i]);
     }
 
@@ -554,11 +562,11 @@ BOOLEAN NvmeGetLogPage(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Sr
 
     // ScsiPort manages the untagged SRB, we can retrieve it in completion with ScsiPortGetSrb()
     if (cmd.CDW0.Fields.CommandId & CID_NON_TAGGED_FLAG) {
-        DevExt->Luns[Srb->Lun].NonTaggedInFlight = Srb;
+        DevExt->Luns[NVME_LUN_INDEX(Srb)].NonTaggedInFlight = Srb;
     }
     if (!NvmeSubmitAdminCommand(DevExt, &cmd)) {
         if (cmd.CDW0.Fields.CommandId & CID_NON_TAGGED_FLAG) {
-            DevExt->Luns[Srb->Lun].NonTaggedInFlight = NULL;
+            DevExt->Luns[NVME_LUN_INDEX(Srb)].NonTaggedInFlight = NULL;
         }
         FreePrpListPage(DevExt, prpPageIndex);
         srbExt->PrpListPage = 0xFF;
@@ -653,12 +661,12 @@ BOOLEAN NvmeGetLogPageEx(
 // NvmeBuildCommandId - Build NVMe Command ID from SRB
 // For tagged requests: QueueTag (bit 15 clear)
 // For non-tagged requests: sequence number with bit 15 set
-// Both carry the LUN in bits 8-10
+// Both carry the logical unit index in bits 8-12
 //
 USHORT NvmeBuildCommandId(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb)
 {
     USHORT commandId;
-    USHORT lunBits = (USHORT)(((ULONG)Srb->Lun << CID_LUN_SHIFT) & CID_LUN_MASK);
+    USHORT lunBits = (USHORT)((NVME_LUN_INDEX(Srb) << CID_LUN_SHIFT) & CID_LUN_MASK);
 
     // Check if this is a tagged request
     // Note: QueueTag == SP_UNTAGGED (0xFF) means non-tagged even if SRB_FLAGS_QUEUE_ACTION_ENABLE is set
@@ -692,7 +700,7 @@ USHORT NvmeBuildFlushCommandId(IN PSCSI_REQUEST_BLOCK Srb)
 
     // For ORDERED flush, use QueueTag with flush flag bit set
     commandId = (USHORT)(((USHORT)Srb->QueueTag & CID_TAG_MASK) |
-                         (((ULONG)Srb->Lun << CID_LUN_SHIFT) & CID_LUN_MASK) |
+                         ((NVME_LUN_INDEX(Srb) << CID_LUN_SHIFT) & CID_LUN_MASK) |
                          CID_ORDERED_FLUSH_FLAG);
 
     return commandId;
@@ -720,7 +728,7 @@ PSCSI_REQUEST_BLOCK NvmeGetSrbFromCommandId(IN PHW_DEVICE_EXTENSION DevExt, IN U
         queueTag = (LONG)(commandId & CID_TAG_MASK);
     }
 
-    Srb = ScsiPortGetSrb(DevExt, 0, 0, lun, queueTag);
+    Srb = ScsiPortGetSrb(DevExt, 0, (UCHAR)(lun / NVMENT_LUNS_PER_TARGET), (UCHAR)(lun % NVMENT_LUNS_PER_TARGET), queueTag);
     if (queueTag == SP_UNTAGGED) {
         if (!Srb)
             Srb = DevExt->Luns[lun].NonTaggedInFlight;
@@ -734,7 +742,7 @@ PSCSI_REQUEST_BLOCK NvmeGetSrbFromCommandId(IN PHW_DEVICE_EXTENSION DevExt, IN U
 //
 int NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN PNVME_COMMAND Cmd, IN USHORT CommandId)
 {
-    PNVME_LUN lun = &DevExt->Luns[Srb->Lun];
+    PNVME_LUN lun = &DevExt->Luns[NVME_LUN_INDEX(Srb)];
     ULONGLONG lba = 0;
     ULONG numBlocks = 0;
     BOOLEAN isWrite = FALSE;
@@ -1037,6 +1045,7 @@ VOID NvmePowerDown(IN PHW_DEVICE_EXTENSION DevExt)
 
     if (DevExt->Stopped) return;
     while ((DevExt->CurrentQueueDepth != 0) && wait++ < 3000000) {
+        if (NvmeReadReg32(DevExt, NVME_REG_CSTS) == 0xFFFFFFFF) break;   // gone: nothing completes
         NvmeProcessIoCompletion(DevExt);
         NvmeProcessAdminCompletion(DevExt);
         ScsiPortStallExecution(NVMENT_POLL_INTERVAL_USEC);
@@ -1062,8 +1071,9 @@ VOID NvmeShutdownController(IN PHW_DEVICE_EXTENSION DevExt)
 #endif
 
     // Check if controller is even enabled before trying to delete queues
+    // (all ones: powered off or gone, nothing to wait for)
     csts = NvmeReadReg32(DevExt, NVME_REG_CSTS);
-    if (!(csts & NVME_CSTS_RDY)) {
+    if (csts == 0xFFFFFFFF || !(csts & NVME_CSTS_RDY)) {
 #ifdef NVMENT_DBG
         ScsiDebugPrint(0, "NVMENT: NvmeShutdownController - controller not ready, skipping queue deletion\n");
 #endif
@@ -1633,7 +1643,7 @@ BOOLEAN NvmeReinitialize(IN PHW_DEVICE_EXTENSION DevExt)
         DevExt->Luns[l].NonTaggedInFlight = NULL;
     }
     if (DevExt->RequestsFlushed) {
-        ScsiPortCompleteRequest(DevExt, 0, 0, SP_UNTAGGED, SRB_STATUS_BUS_RESET);
+        ScsiPortCompleteRequest(DevExt, 0, SP_UNTAGGED, SP_UNTAGGED, SRB_STATUS_BUS_RESET);
     }
     DevExt->CurrentQueueDepth = 0;
     DevExt->InitComplete = FALSE;
@@ -1661,11 +1671,11 @@ BOOLEAN NvmeCheckState(IN PHW_DEVICE_EXTENSION DevExt)
     if (DevExt->ControllerRegisters == NULL) {
         return FALSE;
     }
+    csts = NvmeReadReg32(DevExt, NVME_REG_CSTS);
+    if (csts == 0xFFFFFFFF) {
+        return FALSE;                           // gone or powered off: not set up again
+    }
     if (!DevExt->Stopped) {
-        csts = NvmeReadReg32(DevExt, NVME_REG_CSTS);
-        if (csts == 0xFFFFFFFF) {
-            return FALSE;                       // gone (surprise removal, bus off)
-        }
         if ((csts & NVME_CSTS_RDY) && !(csts & NVME_CSTS_CFS)) {
             return TRUE;
         }

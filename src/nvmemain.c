@@ -7,6 +7,14 @@
 
 // The crash dump / hibernation stack calls DriverEntry without a driver object
 static BOOLEAN g_DumpMode;
+// The disk class driver reads READ CAPACITY(16) when READ CAPACITY(10)
+// reports FFFFFFFFh: Server 2003 SP1 and later, XP x64
+static BOOLEAN g_Capacity16;
+#if (_WIN32_WINNT < 0x500) && !defined(NVMENT_W9X)
+// hal.dll, every NT version; KIRQL and KAFFINITY as UCHAR and ULONG
+ULONG __stdcall HalGetInterruptVector(INTERFACE_TYPE InterfaceType, ULONG BusNumber, ULONG BusInterruptLevel,
+                                      ULONG BusInterruptVector, PUCHAR Irql, PULONG Affinity);
+#endif
 
 #ifdef NVMENT_W9X
 //
@@ -178,6 +186,8 @@ LONG __stdcall ZwCreateKey(PVOID *KeyHandle, ULONG DesiredAccess, PVOID ObjectAt
 LONG __stdcall ZwSetValueKey(PVOID KeyHandle, PVOID ValueName, ULONG TitleIndex, ULONG Type,
                              PVOID Data, ULONG DataSize);
 LONG __stdcall ZwClose(PVOID Handle);
+BOOLEAN __stdcall PsGetVersion(PULONG MajorVersion, PULONG MinorVersion, PULONG BuildNumber,
+                               PNVMENT_UNICODE_STRING CsdVersion);
 
 #define NVMENT_OBJ_CASE_INSENSITIVE     0x00000040
 #define NVMENT_OBJ_KERNEL_HANDLE        0x00000200
@@ -268,6 +278,23 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     if (!g_DumpMode) {
         NvmeEnsurePnpInterface(Argument2);
     }
+#if defined(_AMD64_)
+    g_Capacity16 = TRUE;
+#else
+    {
+        ULONG major = 0, minor = 0, build = 0;
+        NVMENT_UNICODE_STRING csd;
+        csd.Length = 0;
+        csd.MaximumLength = 0;
+        csd.Buffer = NULL;
+        PsGetVersion(&major, &minor, &build, &csd);
+        g_Capacity16 = (BOOLEAN)(major > 5 || (major == 5 && minor >= 2 && (build > 3790 || csd.Length != 0)));
+#ifdef NVMENT_DBG
+        ScsiDebugPrint(0, "NVMENT: Windows %u.%u.%u%s\n", major, minor, build,
+                       g_Capacity16 ? ", READ CAPACITY(16) used" : "");
+#endif
+    }
+#endif
 #endif
 
     // Zero out the initialization data structure
@@ -440,6 +467,27 @@ ULONG HwFoundAdapter(
             ConfigInfo->BusInterruptLevel = 0;
             ConfigInfo->BusInterruptVector = 0;
         }
+#ifndef NVMENT_W9X
+        // The HAL must have a vector for the line: an MPS HAL whose MP table
+        // has no entry for the controller's INTx gives none, and ScsiPort
+        // would then fail the adapter (0x7B with the system disk on it).
+        // Fast Polling needs no interrupt.
+        if (ConfigInfo->BusInterruptLevel != 0 || ConfigInfo->BusInterruptVector != 0) {
+            UCHAR irql = 0;
+            ULONG affinity = 0;
+            ULONG vector = HalGetInterruptVector(ConfigInfo->AdapterInterfaceType, ConfigInfo->SystemIoBusNumber,
+                                                 ConfigInfo->BusInterruptLevel, ConfigInfo->BusInterruptVector,
+                                                 &irql, &affinity);
+            if (vector == 0 || affinity == 0) {
+#ifdef NVMENT_DBG
+                ScsiDebugPrint(0, "NVMENT: no vector for IRQ %u (vector %u, affinity %X), Fast Polling\n",
+                               ConfigInfo->BusInterruptLevel, vector, affinity);
+#endif
+                ConfigInfo->BusInterruptLevel = 0;
+                ConfigInfo->BusInterruptVector = 0;
+            }
+        }
+#endif
 #else
         // Win2000/XP: leave interrupt routing to ScsiPort/HAL; do not override ConfigInfo here.
 #endif
@@ -450,6 +498,10 @@ ULONG HwFoundAdapter(
     // in the dump stack and with "IRQ=0"
     DevExt->DumpMode = (BOOLEAN)(g_DumpMode || ArgPresent(ArgumentString, "DUMP="));
     DevExt->ApstAllowed = ArgPresent(ArgumentString, "APST=1");
+    DevExt->Capacity16 = g_Capacity16;
+    if (ArgPresent(ArgumentString, "RC16=1")) DevExt->Capacity16 = TRUE;
+    if (ArgPresent(ArgumentString, "RC16=0")) DevExt->Capacity16 = FALSE;
+    ParseNamespacesOff(DevExt, ArgumentString);
     DevExt->PollMode = (BOOLEAN)(DevExt->DumpMode || ArgPresent(ArgumentString, "IRQ=0") ||
                                  (ConfigInfo->BusInterruptLevel == 0 && ConfigInfo->BusInterruptVector == 0));
 
@@ -470,8 +522,8 @@ ULONG HwFoundAdapter(
 #ifdef NVMENT_NT31_COMPAT
     if (NVMENT_CONFIG_HAS(ConfigInfo, MaximumNumberOfTargets))
 #endif
-    ConfigInfo->MaximumNumberOfTargets = 2;  // Target 0: namespaces as LUNs; ScsiPort skips the initiator ID (1)
-    ConfigInfo->InitiatorBusId[0] = 1;
+    ConfigInfo->MaximumNumberOfTargets = NVMENT_TARGETS + 1;  // namespaces as LUNs; ScsiPort skips the initiator ID
+    ConfigInfo->InitiatorBusId[0] = NVMENT_INITIATOR_ID;
     ConfigInfo->NumberOfPhysicalBreaks = 511;  // PRP1 + PRP list (512 entries)
     ConfigInfo->AlignmentMask = 0x3;  // DWORD alignment
     ConfigInfo->NeedPhysicalAddresses = TRUE;  // Required for ScsiPortGetPhysicalAddress to work
@@ -1024,7 +1076,7 @@ BOOLEAN HwStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 
     // Shut down (power down), or the controller lost its state (sleep state,
     // BIOS, another driver): set it up again first
-    if (!driverIoctl && Srb->PathId == 0 && Srb->TargetId == 0) {
+    if (!driverIoctl && Srb->PathId == 0 && Srb->TargetId < NVMENT_TARGETS) {
         DevExt->RequestsFlushed = FALSE;
         if (!NvmeCheckState(DevExt)) {
             if (DevExt->RequestsFlushed) {
@@ -1067,12 +1119,13 @@ static BOOLEAN NvmeStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
     }
 #endif
 
-    // Target 0 only; LUN n is the n-th namespace. A controller without
+    // Namespace n is target n / 8, LUN n % 8. A controller without
     // namespaces presents no logical unit at all.
-    if (Srb->PathId != 0 || Srb->TargetId != 0 || Srb->Lun >= NVMENT_MAX_LUNS ||
-        Srb->Lun >= DevExt->LunCount) {
+    if (Srb->PathId != 0 || Srb->TargetId >= NVMENT_TARGETS || Srb->Lun >= NVMENT_LUNS_PER_TARGET ||
+        NVME_LUN_INDEX(Srb) >= DevExt->LunCount) {
         if (Srb->Function == SRB_FUNCTION_EXECUTE_SCSI || Srb->Function == SRB_FUNCTION_IO_CONTROL) {
-            Srb->SrbStatus = (UCHAR)((Srb->PathId == 0 && Srb->TargetId == 0 && DevExt->LunCount != 0) ?
+            ULONG first = (ULONG)Srb->TargetId * NVMENT_LUNS_PER_TARGET;
+            Srb->SrbStatus = (UCHAR)((Srb->PathId == 0 && Srb->TargetId < NVMENT_TARGETS && DevExt->LunCount > first) ?
                                      SRB_STATUS_INVALID_LUN : SRB_STATUS_SELECTION_TIMEOUT);
         } else {
             Srb->SrbStatus = SRB_STATUS_SUCCESS;    // flush/shutdown/reset: nothing there
@@ -1084,7 +1137,7 @@ static BOOLEAN NvmeStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 
     // Sense kept for REQUEST SENSE belongs to the request before only
     if (Srb->Function == SRB_FUNCTION_EXECUTE_SCSI && Srb->Cdb[0] != SCSIOP_REQUEST_SENSE) {
-        DevExt->Luns[Srb->Lun].SensePending = FALSE;
+        DevExt->Luns[NVME_LUN_INDEX(Srb)].SensePending = FALSE;
     }
 
     // Process the SRB based on its function

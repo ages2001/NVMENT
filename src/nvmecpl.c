@@ -334,19 +334,20 @@ BOOLEAN NvmeProcessAdminCompletion(IN PHW_DEVICE_EXTENSION DevExt)
             continue;
         }
 
+        if (commandId == ADMIN_CID_SYNC) {
+            DevExt->SyncStatus = status;
+            DevExt->SyncDw0 = cqEntry->DW0;
+            DevExt->SyncDone = TRUE;
+            continue;
+        }
+
         switch (CID_KIND(commandId)) {
-            case ADMIN_KIND_SYNC:
-                DevExt->SyncStatus = status;
-                DevExt->SyncDw0 = cqEntry->DW0;
-                DevExt->SyncDone = TRUE;
-                break;
 
             case ADMIN_KIND_GET_LOG_PAGE:
                 NvmeProcessGetLogPageCompletion(DevExt, status, commandId);
                 break;
 
-            case ADMIN_KIND_USER_IDENTIFY:
-            case ADMIN_KIND_USER_GET_LOG_PAGE:
+            case ADMIN_KIND_USER:
                 NvmeProcessUserExtensionCompletion(DevExt, commandId, status, cqEntry);
                 break;
 

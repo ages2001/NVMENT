@@ -8,6 +8,16 @@
 
 #include <miniport.h>
 #include <scsi.h>
+
+// x64 MinGW: srb.h turns the register functions into plain volatile
+// accesses, which the compiler may reorder against the queue entries in
+// memory. Take ScsiPort's exported functions, as the x86 build does.
+#if defined(_AMD64_) && defined(__GNUC__)
+#undef ScsiPortReadRegisterUlong
+#undef ScsiPortWriteRegisterUlong
+ULONG ScsiPortReadRegisterUlong(PULONG Register);
+VOID  ScsiPortWriteRegisterUlong(PULONG Register, ULONG Value);
+#endif
 #include <devioctl.h>
 #include <ntddscsi.h>
 #include <ntdddisk.h>
@@ -105,11 +115,17 @@ PVOID __cdecl NvmeMapPhysToLinear(ULONG PhysAddr, ULONG nBytes, ULONG Flags);
 #endif
 
 //
-// Namespaces: each active namespace (up to NVMENT_MAX_LUNS) is one LUN of target 0
+// Namespaces: up to NVMENT_MAX_LUNS active namespaces; namespace n is
+// target n / 8, LUN n % 8, so the first eight keep target 0, LUN 0-7
 //
-#define NVMENT_MAX_LUNS                 8
+#define NVMENT_MAX_LUNS                 32
+#define NVMENT_LUNS_PER_TARGET          8
+#define NVMENT_TARGETS                  (NVMENT_MAX_LUNS / NVMENT_LUNS_PER_TARGET)
+#define NVMENT_INITIATOR_ID             NVMENT_TARGETS      // past the last target
+#define NVME_LUN_INDEX(srb)             ((ULONG)(srb)->TargetId * NVMENT_LUNS_PER_TARGET + (srb)->Lun)
+#define NVMENT_INFO_LUNS                8                   // NVMENT_INFO keeps its layout
 #define NVMENT_MAX_SG_PAGES             32      // PRP list page pool
-#define NVMENT_MAX_CONTROLLERS          8
+#define NVMENT_MAX_CONTROLLERS          32
 
 //
 // Timeouts
@@ -146,20 +162,17 @@ typedef struct _NVME_QUEUE {
     ULONG reserved2;
 } NVME_QUEUE, *PNVME_QUEUE;
 
-// Command ID encoding
-// Bit 15: Set for non-tagged request
-// Bit 14: Set for ORDERED flush (used with bit 15 clear)
-// Bits 11-13: admin request kind (admin queue only, 0 on the I/O queue)
-// Bits 8-10: LUN (namespace index)
-// Bits 0-7: QueueTag (tagged) or sequence number (non-tagged)
+// Command ID: bit 15 non-tagged, bits 12:8 the logical unit index (target
+// * 8 + LUN), bits 7:0 the queue tag (or a sequence number). I/O queue:
+// bit 14 marks an ORDERED flush. Admin queue: bit 13 the kind of an admin
+// command carrying an SRB; synchronous and shutdown commands use fixed IDs.
 #define CID_NON_TAGGED_FLAG 0x8000
 #define CID_ORDERED_FLUSH_FLAG 0x4000
-#define CID_KIND_SHIFT      11
-#define CID_KIND_MASK       0x3800
+#define CID_KIND_SHIFT      13
+#define CID_KIND_MASK       0x2000
 #define CID_LUN_SHIFT       8
-#define CID_LUN_MASK        0x0700
+#define CID_LUN_MASK        0x1F00
 #define CID_TAG_MASK        0x00FF
-#define CID_VALUE_MASK      0x3FFF
 #define CID_LUN(cid)        ((UCHAR)(((cid) & CID_LUN_MASK) >> CID_LUN_SHIFT))
 #define CID_KIND(cid)       (((cid) & CID_KIND_MASK) >> CID_KIND_SHIFT)
 
@@ -172,14 +185,12 @@ typedef struct _NVME_SRB_EXTENSION {
 } NVME_SRB_EXTENSION, *PNVME_SRB_EXTENSION;
 
 //
-// Admin command kinds (CID bits 11-13). SRB-carrying admin commands use
+// Admin command kinds (CID bit 13). SRB-carrying admin commands use
 // CID = kind | LUN | tag-or-sequence (see NvmeBuildAdminCommandId).
 //
-#define ADMIN_KIND_SYNC                 1   // synchronous command, polled by NvmeAdminSync
-#define ADMIN_KIND_GET_LOG_PAGE         2   // Get Log Page for LOG SENSE / SAT / SMART IOCTL
-#define ADMIN_KIND_USER_IDENTIFY        3   // IDENTIFY from userspace via NvmeMini
-#define ADMIN_KIND_USER_GET_LOG_PAGE    4   // GET_LOG_PAGE same
-#define ADMIN_CID_SYNC                  (ADMIN_KIND_SYNC << CID_KIND_SHIFT)
+#define ADMIN_KIND_GET_LOG_PAGE         0   // Get Log Page for LOG SENSE / SAT / SMART IOCTL
+#define ADMIN_KIND_USER                 1   // IDENTIFY / GET LOG PAGE from userspace via NvmeMini
+#define ADMIN_CID_SYNC                  0xFFFC  // synchronous command, polled by NvmeAdminSync
 
 //
 // Admin Command IDs for shutdown sequence (special, non-colliding values)
@@ -227,12 +238,12 @@ typedef struct _NVMENT_INFO {
     ULONG MaxTransfer;                              // bytes
     ULONG QueueDepthMax;
     ULONG InterruptCount;
-    ULONG NamespaceId[NVMENT_MAX_LUNS];
-    ULONG BlockSize[NVMENT_MAX_LUNS];
-    ULONGLONG SizeInBlocks[NVMENT_MAX_LUNS];
+    ULONG NamespaceId[NVMENT_INFO_LUNS];            // the first eight
+    ULONG BlockSize[NVMENT_INFO_LUNS];
+    ULONGLONG SizeInBlocks[NVMENT_INFO_LUNS];
 } NVMENT_INFO, *PNVMENT_INFO;
 
-#define NVMENT_DRIVER_VERSION   0x03000000  // 3.0.0.0
+#define NVMENT_DRIVER_VERSION   0x03010000  // 3.1.0.0
 
 //
 // Device extension structure - stores per-adapter data
@@ -359,6 +370,10 @@ typedef struct _HW_DEVICE_EXTENSION {
     USHORT SyncStatus;                              // ... its status (Status >> 1)
     ULONG SyncDw0;                                  // ... and DW0
 
+    BOOLEAN Capacity16;                             // class driver follows up with READ CAPACITY(16)
+    UCHAR Reserved8[3];
+    ULONG NsOffCount;                               // OFF=: namespaces left out
+    ULONG NsOff[16];
 } HW_DEVICE_EXTENSION, *PHW_DEVICE_EXTENSION;
 
 //
@@ -395,6 +410,7 @@ VOID WritePciConfigDword(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset, IN ULO
 ULONG GetPciConfig(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Bus, IN ULONG Slot, OUT PVOID Buffer, IN ULONG Length);
 VOID PciProbeAccess(IN PHW_DEVICE_EXTENSION DevExt);
 BOOLEAN ArgPresent(IN PCHAR Args, IN PCHAR Key);
+VOID ParseNamespacesOff(IN PHW_DEVICE_EXTENSION DevExt, IN PCHAR Args);
 BOOLEAN NvmeIsOwnSignature(IN PUCHAR Signature);
 
 //

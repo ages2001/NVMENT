@@ -80,9 +80,9 @@ VOID ScsiSetSense(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN
         Srb->SrbStatus |= SRB_STATUS_AUTOSENSE_VALID;
         return;
     }
-    if (Srb->Lun < NVMENT_MAX_LUNS) {
-        memcpy(DevExt->Luns[Srb->Lun].Sense, sense, sizeof(sense));
-        DevExt->Luns[Srb->Lun].SensePending = TRUE;
+    if (NVME_LUN_INDEX(Srb) < NVMENT_MAX_LUNS) {
+        memcpy(DevExt->Luns[NVME_LUN_INDEX(Srb)].Sense, sense, sizeof(sense));
+        DevExt->Luns[NVME_LUN_INDEX(Srb)].SensePending = TRUE;
     }
 }
 
@@ -92,7 +92,7 @@ VOID ScsiSetSense(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN
 //
 BOOLEAN ScsiHandleRequestSense(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb)
 {
-    PNVME_LUN lun = &DevExt->Luns[Srb->Lun];
+    PNVME_LUN lun = &DevExt->Luns[NVME_LUN_INDEX(Srb)];
     UCHAR sense[18];
     ULONG n = Srb->Cdb[4];
 
@@ -252,7 +252,7 @@ static BOOLEAN ScsiVpdDone(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOC
 BOOLEAN ScsiHandleInquiry(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb)
 {
     PCDB cdb = (PCDB)Srb->Cdb;
-    PNVME_LUN lun = &DevExt->Luns[Srb->Lun];
+    PNVME_LUN lun = &DevExt->Luns[NVME_LUN_INDEX(Srb)];
     BOOLEAN dsm = (BOOLEAN)((DevExt->Oncs & NVME_ONCS_DSM) != 0);
     PUCHAR inquiryData;
     UCHAR vpd[64];
@@ -514,7 +514,7 @@ BOOLEAN ScsiHandleReadCapacity(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_
     PULONG capacityData;
     ULONG lastLba;
     ULONG blockSize;
-    PNVME_LUN lun = &DevExt->Luns[Srb->Lun];
+    PNVME_LUN lun = &DevExt->Luns[NVME_LUN_INDEX(Srb)];
 
     if (Srb->DataTransferLength < 8) {
         return ScsiError(DevExt, Srb, SRB_STATUS_DATA_OVERRUN);
@@ -527,9 +527,12 @@ BOOLEAN ScsiHandleReadCapacity(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_
         return ScsiError(DevExt, Srb, Srb->SrbStatus);
     }
     {
-        // Check if capacity exceeds 32-bit
-        if (lun->SizeInBlocks > 0xFFFFFFFF) {
-            lastLba = 0xFFFFFFFF;  // Indicate to use READ CAPACITY(16)
+        // 2 TB and more (last LBA FFFFFFFFh or beyond): FFFFFFFFh sends a class
+        // driver that knows READ CAPACITY(16) there. One that does not (NT
+        // 3.x/4.0, 9x, 2000, XP x86) adds one to it in 32 bits and sees a disk
+        // of 0 bytes; it gets FFFFFFFEh, the most it can address with READ(10).
+        if (lun->SizeInBlocks >= 0x100000000ULL) {
+            lastLba = DevExt->Capacity16 ? 0xFFFFFFFF : 0xFFFFFFFE;
         } else {
             lastLba = (ULONG)(lun->SizeInBlocks - 1);
         }
@@ -557,35 +560,35 @@ BOOLEAN ScsiHandleReadCapacity(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_
 //
 BOOLEAN ScsiHandleReadCapacity16(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb)
 {
-    PUCHAR capacityData;
+    UCHAR capacityData[32];
     ULONGLONG lastLba;
     ULONG blockSize;
-    ULONG i;
+    ULONG allocation, n;
 
     // Check service action (byte 1 of CDB)
     if ((Srb->Cdb[1] & 0x1F) != SERVICE_ACTION_READ_CAPACITY16) {
         return ScsiError(DevExt, Srb, SRB_STATUS_INVALID_REQUEST);
     }
 
-    if (Srb->DataTransferLength < 32) {
+    // As much as the allocation length and the buffer take: the class
+    // drivers of Server 2003 SP1 and XP x64 ask for 12 bytes
+    allocation = ((ULONG)Srb->Cdb[10] << 24) | ((ULONG)Srb->Cdb[11] << 16) |
+                 ((ULONG)Srb->Cdb[12] << 8) | Srb->Cdb[13];
+    n = sizeof(capacityData);
+    if (n > allocation) n = allocation;
+    if (n > Srb->DataTransferLength) n = Srb->DataTransferLength;
+    if (n == 0 || Srb->DataBuffer == NULL) {
         return ScsiError(DevExt, Srb, SRB_STATUS_DATA_OVERRUN);
     }
 
-    capacityData = (PUCHAR)Srb->DataBuffer;
+    memset(capacityData, 0, sizeof(capacityData));
 
-    // Clear the buffer
-    for (i = 0; i < 32; i++) {
-        capacityData[i] = 0;
-    }
-
-    if (DevExt->Luns[Srb->Lun].SizeInBlocks == 0) {
+    if (DevExt->Luns[NVME_LUN_INDEX(Srb)].SizeInBlocks == 0) {
         ScsiSetSense(DevExt, Srb, SCSI_SENSE_NOT_READY, 0x04, 0x00);
         return ScsiError(DevExt, Srb, Srb->SrbStatus);
     }
-    {
-        lastLba = DevExt->Luns[Srb->Lun].SizeInBlocks - 1;
-        blockSize = DevExt->Luns[Srb->Lun].BlockSize;
-    }
+    lastLba = DevExt->Luns[NVME_LUN_INDEX(Srb)].SizeInBlocks - 1;
+    blockSize = DevExt->Luns[NVME_LUN_INDEX(Srb)].BlockSize;
 
     // Bytes 0-7: Returned Logical Block Address (64-bit big-endian)
     capacityData[0] = (UCHAR)(lastLba >> 56);
@@ -603,21 +606,13 @@ BOOLEAN ScsiHandleReadCapacity16(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUES
     capacityData[10] = (UCHAR)(blockSize >> 8);
     capacityData[11] = (UCHAR)(blockSize);
 
-    // Bytes 12-13: Additional fields (set to 0 for now)
-    // Byte 12, bit 0: PROT_EN (protection type enabled) - 0
-    // Byte 13: P_TYPE and P_I_EXPONENT - 0
-
-    // Bytes 14-15: Logical blocks per physical block exponent and alignment
-    // Byte 14, bits 3-0: Logical blocks per physical block exponent - 0
-    // Bytes 14-15: Lowest aligned logical block address - 0
     // Byte 14, bit 7: LBPME - UNMAP is translated to Dataset Management (deallocate)
     if (DevExt->Oncs & NVME_ONCS_DSM) {
         capacityData[14] = 0x80;
     }
 
-    // Bytes 16-31: Reserved (already zeroed)
-
-    Srb->DataTransferLength = 32;
+    memcpy(Srb->DataBuffer, capacityData, n);
+    Srb->DataTransferLength = n;
     return ScsiSuccess(DevExt, Srb);
 }
 
@@ -629,7 +624,7 @@ BOOLEAN ScsiHandleReadWrite(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLO
     NVME_COMMAND nvmeCmd;
     USHORT commandId;
     PNVME_SRB_EXTENSION srbExt;
-    PNVME_LUN lun = &DevExt->Luns[Srb->Lun];
+    PNVME_LUN lun = &DevExt->Luns[NVME_LUN_INDEX(Srb)];
     ULONGLONG lba;
     ULONG count;
     BOOLEAN isWrite, fua;
@@ -888,7 +883,7 @@ BOOLEAN ScsiHandleFlush(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK S
 {
     NVME_COMMAND nvmeCmd;
     USHORT commandId;
-    PNVME_LUN lun = &DevExt->Luns[Srb->Lun];
+    PNVME_LUN lun = &DevExt->Luns[NVME_LUN_INDEX(Srb)];
 
     // No namespace on this LUN (SHUTDOWN/FLUSH for the adapter): nothing to flush
     if (lun->NamespaceId == 0) {
@@ -933,7 +928,7 @@ BOOLEAN ScsiHandleFlush(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK S
 //
 static BOOLEAN ScsiSubmitNoData(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN PNVME_COMMAND Cmd)
 {
-    PNVME_LUN lun = &DevExt->Luns[Srb->Lun];
+    PNVME_LUN lun = &DevExt->Luns[NVME_LUN_INDEX(Srb)];
     PNVME_SRB_EXTENSION srbExt = (PNVME_SRB_EXTENSION)Srb->SrbExtension;
 
     if (!IsTagged(Srb)) {
@@ -960,7 +955,7 @@ static BOOLEAN ScsiSubmitNoData(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST
 //
 BOOLEAN ScsiHandleVerify(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb)
 {
-    PNVME_LUN lun = &DevExt->Luns[Srb->Lun];
+    PNVME_LUN lun = &DevExt->Luns[NVME_LUN_INDEX(Srb)];
     NVME_COMMAND cmd;
     ULONGLONG lba;
     ULONG count;
@@ -1001,7 +996,7 @@ BOOLEAN ScsiHandleVerify(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK 
 //
 BOOLEAN ScsiHandleUnmap(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb)
 {
-    PNVME_LUN lun = &DevExt->Luns[Srb->Lun];
+    PNVME_LUN lun = &DevExt->Luns[NVME_LUN_INDEX(Srb)];
     PNVME_SRB_EXTENSION srbExt = (PNVME_SRB_EXTENSION)Srb->SrbExtension;
     PUCHAR param = (PUCHAR)Srb->DataBuffer;
     PULONG ranges;
@@ -1175,9 +1170,14 @@ BOOLEAN ScsiHandleReportLuns(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BL
     PUCHAR data = (PUCHAR)Srb->DataBuffer;
     ULONG allocation = ((ULONG)Srb->Cdb[6] << 24) | ((ULONG)Srb->Cdb[7] << 16) |
                        ((ULONG)Srb->Cdb[8] << 8) | Srb->Cdb[9];
-    ULONG luns = DevExt->LunCount;
-    ULONG length = 8 + luns * 8;
+    ULONG first = (ULONG)Srb->TargetId * NVMENT_LUNS_PER_TARGET;
+    ULONG luns = (DevExt->LunCount > first) ? DevExt->LunCount - first : 0;
+    ULONG length;
     ULONG i;
+
+    // The namespaces of this target
+    if (luns > NVMENT_LUNS_PER_TARGET) luns = NVMENT_LUNS_PER_TARGET;
+    length = 8 + luns * 8;
 
     if (allocation > Srb->DataTransferLength) {
         allocation = Srb->DataTransferLength;
@@ -1273,7 +1273,7 @@ BOOLEAN ScsiHandleModeSense(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLO
     ULONG blockDescLength;
     ULONG totalLength;
     ULONG pageStart;
-    PNVME_LUN lun = &DevExt->Luns[Srb->Lun];
+    PNVME_LUN lun = &DevExt->Luns[NVME_LUN_INDEX(Srb)];
 
 #ifdef NVMENT_DBG
     ScsiDebugPrint(0, "NVMENT: ScsiHandleModeSense called DataTransferLength:%d\n", Srb->DataTransferLength);
@@ -1798,7 +1798,7 @@ BOOLEAN HandleIO_NVMENT(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK S
                 info->MaxTransfer = DevExt->MaxTransferSizeBytes;
                 info->QueueDepthMax = DevExt->MaxQueueDepthReached;
                 info->InterruptCount = DevExt->InterruptCount;
-                for (l = 0; l < NVMENT_MAX_LUNS; l++) {
+                for (l = 0; l < NVMENT_INFO_LUNS; l++) {
                     info->NamespaceId[l] = DevExt->Luns[l].NamespaceId;
                     info->BlockSize[l] = DevExt->Luns[l].BlockSize;
                     info->SizeInBlocks[l] = DevExt->Luns[l].SizeInBlocks;
@@ -1951,7 +1951,7 @@ BOOLEAN HandleIO_NvmeMini(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK
             // CDW10 bits 0-7 = CNS (Controller or Namespace Structure)
             // IDENTIFY always returns 4KB of data
             parameter = (UCHAR)(nvmeCmd[10] & 0xFF);
-            commandId = NvmeBuildAdminCommandId(DevExt, Srb, ADMIN_KIND_USER_IDENTIFY);
+            commandId = NvmeBuildAdminCommandId(DevExt, Srb, ADMIN_KIND_USER);
 
 #ifdef NVMENT_DBG
             ScsiDebugPrint(0, "NVMENT: NvmeMini IDENTIFY - NSID=%u CNS=%02X CDW10=%08X CID=%04X\n",
@@ -1981,7 +1981,7 @@ BOOLEAN HandleIO_NvmeMini(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK
                 ULONG numdl = (nvmeCmd[10] >> 16) & 0xFFFF;
 
                 parameter = (UCHAR)(nvmeCmd[10] & 0xFF);
-                commandId = NvmeBuildAdminCommandId(DevExt, Srb, ADMIN_KIND_USER_GET_LOG_PAGE);
+                commandId = NvmeBuildAdminCommandId(DevExt, Srb, ADMIN_KIND_USER);
 
 #ifdef NVMENT_DBG
                 ScsiDebugPrint(0, "NVMENT: NvmeMini GET_LOG_PAGE - NSID=%u LID=%02X CDW10=%08X (NUMDL=%u) CID=%04X\n",
