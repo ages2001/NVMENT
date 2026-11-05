@@ -131,9 +131,24 @@ PVOID __cdecl NvmeMapPhysToLinear(ULONG PhysAddr, ULONG nBytes, ULONG Flags);
 // Timeouts
 //
 #define NVMENT_ADMIN_TIMEOUT_MS         5000    // synchronous admin commands
-#define NVMENT_POLL_INTERVAL_USEC       10      // Fast Polling
+#define NVMENT_HOTPLUG_ADMIN_MS         100     // namespace list read by the hot-plug check
+#define NVMENT_MAX_META                 16      // metadata bytes per block the driver keeps in one page
+//
+// Polling (no interrupt): the first NVMENT_POLL_SPINS microseconds of
+// checks follow each other without a pause, so that a command done within
+// microseconds is seen at once; then one check per microsecond. A check
+// counts as its pause plus its register reads, so the time limits hold.
+//
+#define NVMENT_POLL_SPINS               64
+#define NVMENT_POLL_INTERVAL_USEC       1
+#define NVMENT_POLL_STEP(elapsed, reads) { if ((elapsed) >= NVMENT_POLL_SPINS) ScsiPortStallExecution(NVMENT_POLL_INTERVAL_USEC); (elapsed) += NVMENT_POLL_INTERVAL_USEC + (reads); }
 #define NVMENT_WATCHDOG_USEC            100000  // interrupt watchdog while commands are outstanding
+#define NVMENT_HOTPLUG_USEC             1000000 // HOTPLUG=1: controller checked this often
+#define NVMENT_HOTPLUG_NS_TICKS         2       // ... and the namespace list every so many checks
 #define NVMENT_APST_MAX_LATENCY_US      100000  // APST: deepest state with an exit latency up to 100 ms
+#define NVMENT_HMB_MAX_MB               64      // host memory buffer: at most this, and 1/16 of the RAM
+#define NVMENT_HMB_CHUNK                0x400000 // largest piece asked for at once (4 MB)
+#define NVMENT_HMB_MAX_ENTRIES          256     // descriptors in one page
 #define NVMENT_MISSED_IRQ_LIMIT         5       // watchdog finds lost interrupts this often -> Fast Polling
 
 //
@@ -181,7 +196,8 @@ typedef struct _NVME_QUEUE {
 //
 typedef struct _NVME_SRB_EXTENSION {
     UCHAR PrpListPage;              // Which PRP list page is allocated (0xFF if none)
-    UCHAR Reserved[3];              // Padding for alignment
+    UCHAR MetaPage;                 // page holding the metadata of a namespace with MS != 0 (0xFF if none)
+    UCHAR Reserved[2];              // Padding for alignment
 } NVME_SRB_EXTENSION, *PNVME_SRB_EXTENSION;
 
 //
@@ -191,6 +207,7 @@ typedef struct _NVME_SRB_EXTENSION {
 #define ADMIN_KIND_GET_LOG_PAGE         0   // Get Log Page for LOG SENSE / SAT / SMART IOCTL
 #define ADMIN_KIND_USER                 1   // IDENTIFY / GET LOG PAGE from userspace via NvmeMini
 #define ADMIN_CID_SYNC                  0xFFFC  // synchronous command, polled by NvmeAdminSync
+#define ADMIN_CID_AER                   0xFFFB  // Asynchronous Event Request, always outstanding
 
 //
 // Admin Command IDs for shutdown sequence (special, non-colliding values)
@@ -209,9 +226,14 @@ typedef struct _NVME_LUN {
     BOOLEAN Thin;                                   // NSFEAT thin provisioning
     UCHAR BlockShift;                               // log2(BlockSize)
     BOOLEAN SensePending;                           // sense kept for REQUEST SENSE (no autosense)
-    UCHAR Reserved;
+    UCHAR LbaShift;                                 // 4K=1: SCSI block = 2^LbaShift namespace blocks
     UCHAR Sense[18];                                // fixed format
     UCHAR Reserved2[2];
+    ULONG GoneNsid;                                 // the namespace this LUN had, while it is away
+    ULONGLONG GoneSize;                             // ... and its NSZE
+    USHORT MetaSize;                                // MS: metadata bytes per namespace block, kept in MetaPage
+    BOOLEAN PiAct;                                  // protection information inserted/stripped by the controller (PRACT)
+    UCHAR Reserved3;
 } NVME_LUN, *PNVME_LUN;
 
 //
@@ -220,6 +242,7 @@ typedef struct _NVME_LUN {
 #define NVMENT_IOCTL_QUERY_INFO       0x1000
 #define NVMENT_IOCTL_TRIM_MODE_ON     0x1001
 #define NVMENT_IOCTL_TRIM_MODE_OFF    0x1002
+#define NVMENT_IOCTL_GET_LOCATION     0x1003  // ULONG: bus << 16 | device << 8 | function
 #define NVMENT_IOCTL_POWER_DOWN       0x1010  // shutdown notification; the next request or POWER_UP brings it back
 #define NVMENT_IOCTL_POWER_UP         0x1011
 
@@ -227,7 +250,8 @@ typedef struct _NVME_LUN {
 #define NVMENT_INFO_POWERED_DOWN        0x00000002
 #define NVMENT_INFO_VWC                 0x00000004  // volatile write cache enabled
 #define NVMENT_INFO_TRIM_MODE           0x00000008  // writes of the TRIM pattern become deallocates
-#define NVMENT_INFO_APST                0x00000010  // autonomous power state transitions on (APST=1)
+#define NVMENT_INFO_APST                0x00000010  // autonomous power state transitions on
+#define NVMENT_INFO_HMB                 0x00000020  // host memory buffer given to the controller
 
 typedef struct _NVMENT_INFO {
     ULONG Version;                                  // NVMENT_DRIVER_VERSION
@@ -243,7 +267,7 @@ typedef struct _NVMENT_INFO {
     ULONGLONG SizeInBlocks[NVMENT_INFO_LUNS];
 } NVMENT_INFO, *PNVMENT_INFO;
 
-#define NVMENT_DRIVER_VERSION   0x03010000  // 3.1.0.0
+#define NVMENT_DRIVER_VERSION   0x03020000  // 3.2.0.0
 
 //
 // Device extension structure - stores per-adapter data
@@ -332,7 +356,7 @@ typedef struct _HW_DEVICE_EXTENSION {
     PHYSICAL_ADDRESS UncachedExtensionPhys;         // Offset 0x178 (376) [8-byte aligned]
     PVOID UncachedExtensionBase;                    // Offset 0x180 (384)
     ULONG UncachedExtensionSize;                    // Offset 0x184 (388)
-    ULONG FallbackTimerNeeded;                      // Offset 0x188 (392) - unused (NvmeWatchdog)
+    ULONG FallbackTimerNeeded;                      // Offset 0x188 (392) - unused (NvmeTimer)
 
     // TRIM mode support
     BOOLEAN TrimEnable;
@@ -357,6 +381,19 @@ typedef struct _HW_DEVICE_EXTENSION {
     UCHAR Reserved6a;
     ULONG ApstTable[64];                            // 32 entries of 8 bytes, Set Features 0Ch data
 
+    // Host Memory Buffer (NT family; HMB=0 off, HMB=n at most n MB)
+    BOOLEAN HmbAllowed;
+    BOOLEAN HmbOn;                                  // enabled on the controller
+    USHORT HmbEntries;                              // descriptors in HmbList
+    ULONG HmbCapMb;                                 // HMB=n, 0: the default limit
+    ULONG Hmpre;                                    // preferred size (4 KB units)
+    ULONG Hmmin;                                    // minimum size (4 KB units)
+    ULONG Hmminds;                                  // minimum descriptor size (4 KB units)
+    ULONG Hmmaxd;                                   // maximum descriptors, 0: no limit
+    ULONG HmbPages;                                 // given to the controller (4 KB units)
+    PULONG HmbList;                                 // descriptor list (one page)
+    ULONGLONG HmbListPhys;
+
     // Mode of operation
     BOOLEAN PollMode;                               // Fast Polling: no interrupt in use
     BOOLEAN DumpMode;                               // crash dump / hibernation stack
@@ -371,7 +408,31 @@ typedef struct _HW_DEVICE_EXTENSION {
     ULONG SyncDw0;                                  // ... and DW0
 
     BOOLEAN Capacity16;                             // class driver follows up with READ CAPACITY(16)
-    UCHAR Reserved8[3];
+    BOOLEAN Sector4K;                               // 4K=1: namespaces of 2 TB and more as 4096-byte blocks
+    BOOLEAN HotPlug;                                // a controller that goes away is noticed (off with HOTPLUG=0)
+    UCHAR HpTicks;                                  // checks since the namespace list was read
+    BOOLEAN HpNamespaces;                           // HOTPLUG=1: namespaces come and go
+    ULONG TimerUsec;                                // interval of the timer armed
+    ULONG HpElapsed;                                // microseconds since the last hot-plug check
+
+    // Asynchronous events and administration
+    BOOLEAN AdminAll;                               // ADMIN=1: destructive admin commands through the pass-through
+    BOOLEAN AerOn;                                  // an Asynchronous Event Request is kept outstanding
+    BOOLEAN AerOutstanding;
+    BOOLEAN AerLogPending;                          // an event came in: its log page is read by the timer
+    UCHAR AerType;
+    UCHAR AerInfo;
+    UCHAR AerLog;
+    BOOLEAN NsChangePending;                        // namespace list to be read again
+    BOOLEAN NsRefresh;                              // ... and the namespaces' own data (after a format)
+    BOOLEAN NsListBroken;                           // a namespace list read did not finish in time
+    UCHAR HealthWarning;                            // SMART critical warning byte of the last health event
+    BOOLEAN TransferReported;                       // MaximumTransferLength given to ScsiPort
+    ULONG Oaes;                                     // Identify Controller OAES
+    USHORT Oacs;                                    // Identify Controller OACS
+    USHORT Cntlid;                                  // Identify Controller CNTLID
+    ULONG AerEvents;                                // events received
+    ULONG ReportedTransfer;                         // the MaximumTransferLength ScsiPort was given
     ULONG NsOffCount;                               // OFF=: namespaces left out
     ULONG NsOff[16];
 } HW_DEVICE_EXTENSION, *PHW_DEVICE_EXTENSION;
@@ -410,6 +471,7 @@ VOID WritePciConfigDword(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset, IN ULO
 ULONG GetPciConfig(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Bus, IN ULONG Slot, OUT PVOID Buffer, IN ULONG Length);
 VOID PciProbeAccess(IN PHW_DEVICE_EXTENSION DevExt);
 BOOLEAN ArgPresent(IN PCHAR Args, IN PCHAR Key);
+ULONG ArgDecimal(IN PCHAR Args, IN PCHAR Key, IN ULONG Default);
 VOID ParseNamespacesOff(IN PHW_DEVICE_EXTENSION DevExt, IN PCHAR Args);
 BOOLEAN NvmeIsOwnSignature(IN PUCHAR Signature);
 
@@ -439,6 +501,10 @@ BOOLEAN NvmeSubmitAdminCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_COMMAND 
 BOOLEAN NvmeProcessAdminCompletion(IN PHW_DEVICE_EXTENSION DevExt);
 VOID NvmeShutdownController(IN PHW_DEVICE_EXTENSION DevExt);
 VOID NvmePowerDown(IN PHW_DEVICE_EXTENSION DevExt);
+VOID NvmeSetupHmb(IN PHW_DEVICE_EXTENSION DevExt);
+BOOLEAN NvmeEnableHmb(IN PHW_DEVICE_EXTENSION DevExt);
+VOID NvmeFullPower(IN PHW_DEVICE_EXTENSION DevExt);
+VOID NvmeHookDeviceControl(IN PVOID DriverObject);   // nvmepdo.c (2000/XP)
 BOOLEAN NvmeSanitizeController(IN PHW_DEVICE_EXTENSION DevExt);
 BOOLEAN NvmeInitializeController(IN PHW_DEVICE_EXTENSION DevExt);
 VOID NvmeEnableInterrupts(IN PHW_DEVICE_EXTENSION DevExt);
@@ -506,6 +572,13 @@ VOID NvmeProcessUserExtensionCompletion(IN PHW_DEVICE_EXTENSION DevExt, IN USHOR
 // PRP list page allocator
 //
 UCHAR AllocatePrpListPage(IN PHW_DEVICE_EXTENSION DevExt);
+BOOLEAN NvmeHotPlugNamespaces(IN PHW_DEVICE_EXTENSION DevExt);
+VOID NvmeFreeSrbPages(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_SRB_EXTENSION SrbExt);
+VOID NvmeStartAer(IN PHW_DEVICE_EXTENSION DevExt);
+BOOLEAN NvmeUserAdmin(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN PNVME_PASS_THROUGH Pt);
+VOID NvmeSubmitAer(IN PHW_DEVICE_EXTENSION DevExt);
+VOID NvmeAerReadLog(IN PHW_DEVICE_EXTENSION DevExt);
+VOID NvmeArmHotPlug(IN PHW_DEVICE_EXTENSION DevExt);
 VOID FreePrpListPage(IN PHW_DEVICE_EXTENSION DevExt, IN UCHAR PageIndex);
 PVOID GetPrpListPageVirtual(IN PHW_DEVICE_EXTENSION DevExt, IN UCHAR PageIndex);
 PHYSICAL_ADDRESS GetPrpListPagePhysical(IN PHW_DEVICE_EXTENSION DevExt, IN UCHAR PageIndex);

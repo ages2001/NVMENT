@@ -6,7 +6,8 @@
  * namespaces (NVMENT) or slots (MMCSDNT) of one controller with a check
  * box each. A cleared box becomes an OFF= item for that controller in the
  * DriverParameters value of the driver's service; the driver reads it
- * when the controller starts. Built once per driver:
+ * when the controller starts. IDENT also lists each device's transfer
+ * mode: "PIO only" becomes a PIO= item. Built once per driver:
  *   PP_AHCI -> ahcipp.dll, PP_IDE -> identpp.dll,
  *   PP_NVME -> nvmentpp.dll, PP_MMC -> mmcsdpp.dll
  * INF: HKR,,EnumPropPages32,,"<dll>,PortPageProvider"
@@ -14,13 +15,26 @@
  * Also exported for scripted tests: PortPageTest (rundll32 entry,
  * "<controller index> <out file> [apply items]"), see TESTS.TXT.
  *
+ * With PP_EXE the same list is a program of its own for the systems
+ * without that page: Windows NT 3.1 to 4.0 (controllers found as
+ * \\.\ScsiN:, DriverParameters as above) and Windows 95/98/Me (the
+ * AdapterSettings value of each controller's driver key; no live device
+ * list there). It runs on 2000/XP as well:
+ *   PP_AHCI -> ahcicfg.exe, PP_IDE -> identcfg.exe,
+ *   PP_NVME -> nvmecfg.exe, PP_MMC -> mmccfg.exe
+ * "<exe> /t <controller index> <out file> [apply items]" is the scripted
+ * form, as PortPageTest. nvmecfg also takes "/ns <controller index> <out
+ * file> <action>" for namespace administration (see PpExeNs).
+ *
  * Copyright (c) 2026 ages2001
  */
 
 #include <windows.h>
+#ifndef PP_EXE
 #include <commctrl.h>
 #include <prsht.h>
 #include <setupapi.h>
+#endif
 #include <winioctl.h>
 #include <ntddscsi.h>
 
@@ -48,6 +62,25 @@
 #error PP_AHCI, PP_IDE, PP_NVME or PP_MMC
 #endif
 
+/* The program (PP_EXE): what identifies a controller of the driver */
+#if defined(PP_AHCI)
+#define PP_MPD          "AHCINT9X.MPD"
+#define PP_LOC_SIG      PP_SIGNATURE
+#define PP_LOC_CODE     2
+#elif defined(PP_IDE)
+#define PP_MPD          "IDENT9X.MPD"
+#define PP_LOC_SIG      PP_SIGNATURE
+#define PP_LOC_CODE     2
+#elif defined(PP_NVME)
+#define PP_MPD          "NVMENT9X.MPD"
+#define PP_LOC_SIG      "NVMENT  "
+#define PP_LOC_CODE     0x1003
+#else
+#define PP_MPD          "MMCSD9X.MPD"
+#define PP_LOC_SIG      PP_SIGNATURE
+#define PP_LOC_CODE     2
+#endif
+
 #define PP_MAX_ROWS     96
 #define PP_MAX_ITEMS    128
 #define PP_MAX_OTHERS   32
@@ -57,10 +90,13 @@
 #define IDC_LIST        101
 #define IDC_PLABEL      102
 #define IDC_PARAMS      103
+#define IDC_PIO         104
 
+#ifndef PP_EXE
 /* {2ACCFE60-C130-11D2-B082-00A0C91EFB8B}: ScsiPort registers it for every adapter */
 static const GUID PpStoragePortGuid =
     { 0x2accfe60, 0xc130, 0x11d2, { 0xb0, 0x82, 0x00, 0xa0, 0xc9, 0x1e, 0xfb, 0x8b } };
+#endif
 
 static HINSTANCE PpInstance;
 
@@ -166,8 +202,8 @@ static const char *PpParseItem(const char *p, PP_ITEM *it)
     return p;
 }
 
-/* Splits the parameter string into the OFF= items and the rest */
-static int PpSplit(const char *params, PP_ITEM *items, int max, char *rest, int restSize)
+/* Splits the parameter string into the items of Key ("OFF=", "PIO=") and the rest */
+static int PpSplitKey(const char *params, const char *key, PP_ITEM *items, int max, char *rest, int restSize)
 {
     const char *p = params;
     int n = 0;
@@ -177,7 +213,7 @@ static int PpSplit(const char *params, PP_ITEM *items, int max, char *rest, int 
         while (*p && PpIsSpace(*p)) p++;
         if (!*p) break;
         start = p;
-        if (PpUpper(p[0]) == 'O' && PpUpper(p[1]) == 'F' && PpUpper(p[2]) == 'F' && p[3] == '=') {
+        if (PpUpper(p[0]) == key[0] && PpUpper(p[1]) == key[1] && PpUpper(p[2]) == key[2] && p[3] == '=') {
             p += 4;
             for (;;) {
                 PP_ITEM it;
@@ -188,7 +224,7 @@ static int PpSplit(const char *params, PP_ITEM *items, int max, char *rest, int 
                 if (*p != ',') break;
                 p++;
             }
-            while (*p && !PpIsSpace(*p)) p++;       /* anything unparsable after OFF= is dropped */
+            while (*p && !PpIsSpace(*p)) p++;       /* anything unparsable after the key is dropped */
         } else {
             char tok[256];
             while (*p && !PpIsSpace(*p)) p++;
@@ -198,6 +234,11 @@ static int PpSplit(const char *params, PP_ITEM *items, int max, char *rest, int 
         }
     }
     return n;
+}
+
+static int PpSplit(const char *params, PP_ITEM *items, int max, char *rest, int restSize)
+{
+    return PpSplitKey(params, "OFF=", items, max, rest, restSize);
 }
 
 static BOOL PpSameLoc(const PP_ITEM *it, const PP_LOC *l)
@@ -241,15 +282,15 @@ static int PpAddItem(PP_ITEM *items, int n, int max, const PP_ITEM *it)
  * for all controllers that this one should no longer follow is given to
  * every other controller of the driver by its PCI location.
  */
-static void PpRebuild(const char *params, const PP_LOC *self, const PP_LOC *others, int nOthers,
-                      char offBodies[][24], int nOff, char *out, int outSize)
+static void PpRebuildKey(const char *key, const char *params, const PP_LOC *self, const PP_LOC *others, int nOthers,
+                         char offBodies[][24], int nOff, char *out, int outSize)
 {
     static PP_ITEM items[PP_MAX_ITEMS], result[PP_MAX_ITEMS];
     char rest[PP_PARAM_LEN], text[48];
     int n, r = 0, i, j, k;
     BOOL used[PP_MAX_ROWS];
 
-    n = PpSplit(params, items, PP_MAX_ITEMS, rest, sizeof(rest));
+    n = PpSplitKey(params, key, items, PP_MAX_ITEMS, rest, sizeof(rest));
     for (k = 0; k < nOff && k < PP_MAX_ROWS; k++) used[k] = FALSE;
 
     for (i = 0; i < n; i++) {
@@ -295,7 +336,7 @@ static void PpRebuild(const char *params, const PP_LOC *self, const PP_LOC *othe
     PpAppend(out, rest, outSize);
     if (r > 0) {
         if (out[0]) PpAppend(out, " ", outSize);
-        PpAppend(out, "OFF=", outSize);
+        PpAppend(out, key, outSize);
         for (i = 0; i < r; i++) {
             PpItemText(text, &result[i]);
             if (i) PpAppend(out, ",", outSize);
@@ -313,11 +354,16 @@ typedef struct {
     char Label[48];
     char Desc[128];
     BOOL On;
+    BOOL Pio;           /* IDENT device: PIO only (PIO= item) */
 } PP_ROW;
 
 typedef struct {
+#ifdef PP_EXE
+    int             Port;           /* \\.\ScsiN:, -1 on 9x */
+#else
     HDEVINFO        Set;
     SP_DEVINFO_DATA Dev;
+#endif
     PP_LOC          Self;
     PP_LOC          Others[PP_MAX_OTHERS];
     int             NumOthers;
@@ -331,6 +377,7 @@ typedef struct {
 
 static UCHAR PpBuf[16384];
 
+#ifndef PP_EXE
 static BOOL PpLocation(HDEVINFO set, PSP_DEVINFO_DATA dev, PP_LOC *loc)
 {
     DWORD bus = 0, addr = 0, type, n;
@@ -401,14 +448,116 @@ static HANDLE PpOpenAdapter(PP_PAGE *pg)
     return h;
 }
 
+#endif
+
+#ifdef PP_EXE
+/* The controllers of the driver: NT family by the ScsiPort device map,
+   9x by the PortDriver of the driver keys */
+typedef struct {
+    int    Port;            /* \\.\ScsiN:, -1 on 9x */
+    char   Key[160];        /* 9x: driver key under HKLM */
+    PP_LOC Loc;
+    char   Name[96];
+} PP_CTL;
+
+static PP_CTL PpCtl[PP_MAX_OTHERS];
+static int PpCtlCount;
+static BOOL Pp9x;
+
+static HANDLE PpOpenPort(int port)
+{
+    char name[32];
+    wsprintfA(name, "\\\\.\\Scsi%d:", port);
+    return CreateFileA(name, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                       OPEN_EXISTING, 0, NULL);
+}
+
+static HANDLE PpOpenAdapter(PP_PAGE *pg)
+{
+    if (pg->Port < 0) return INVALID_HANDLE_VALUE;
+    return PpOpenPort(pg->Port);
+}
+
+static BOOL PpMiniportSig(HANDLE h, const char *sig, ULONG code, ULONG length);
+
+static void PpFindControllers(void)
+{
+    char key[160], value[64];
+    HKEY k;
+    DWORD type, n;
+    int port, i;
+
+    PpCtlCount = 0;
+    Pp9x = (GetVersion() & 0x80000000) != 0;
+    if (!Pp9x) {
+        for (port = 0; port < 64 && PpCtlCount < PP_MAX_OTHERS; port++) {
+            PP_CTL *c = &PpCtl[PpCtlCount];
+            HANDLE h;
+            wsprintfA(key, "HARDWARE\\DEVICEMAP\\Scsi\\Scsi Port %d", port);
+            if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, key, 0, KEY_READ, &k) != ERROR_SUCCESS) continue;
+            n = sizeof(value);
+            value[0] = 0;
+            if (RegQueryValueExA(k, "Driver", NULL, &type, (LPBYTE)value, &n) != ERROR_SUCCESS || type != REG_SZ) value[0] = 0;
+            RegCloseKey(k);
+            if (lstrcmpiA(value, PP_SERVICE) != 0) continue;
+            memset(c, 0, sizeof(*c));
+            c->Port = port;
+            h = PpOpenPort(port);
+            if (h != INVALID_HANDLE_VALUE) {
+                memset(PpBuf, 0, sizeof(SRB_IO_CONTROL) + 4);
+                if (PpMiniportSig(h, PP_LOC_SIG, PP_LOC_CODE, 4)) {
+                    ULONG v = PpGet32(PpBuf + sizeof(SRB_IO_CONTROL));
+                    if (v != 0xFFFFFFFF) {
+                        c->Loc.Pci = TRUE;
+                        c->Loc.Bus = v >> 16;
+                        c->Loc.Dev = (v >> 8) & 0xFF;
+                        c->Loc.Fn = v & 0xFF;
+                    }
+                }
+                CloseHandle(h);
+            }
+            if (c->Loc.Pci) wsprintfA(c->Name, "SCSI port %d, PCI %lu.%lu.%lu", port, c->Loc.Bus, c->Loc.Dev, c->Loc.Fn);
+            else wsprintfA(c->Name, "SCSI port %d", port);
+            PpCtlCount++;
+        }
+        return;
+    }
+    {
+        static const char *classes[] = { "SCSIAdapter", "hdc" };
+        int cl;
+        for (cl = 0; cl < 2; cl++) {
+            for (i = 0; i < 100 && PpCtlCount < PP_MAX_OTHERS; i++) {
+                PP_CTL *c = &PpCtl[PpCtlCount];
+                wsprintfA(key, "System\\CurrentControlSet\\Services\\Class\\%s\\%04d", classes[cl], i);
+                if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, key, 0, KEY_READ, &k) != ERROR_SUCCESS) continue;
+                n = sizeof(value);
+                value[0] = 0;
+                if (RegQueryValueExA(k, "PortDriver", NULL, &type, (LPBYTE)value, &n) != ERROR_SUCCESS) value[0] = 0;
+                if (lstrcmpiA(value, PP_MPD) == 0) {
+                    memset(c, 0, sizeof(*c));
+                    c->Port = -1;
+                    lstrcpyA(c->Key, key);
+                    n = sizeof(c->Name) - 16;
+                    if (RegQueryValueExA(k, "DriverDesc", NULL, &type, (LPBYTE)c->Name, &n) != ERROR_SUCCESS) c->Name[0] = 0;
+                    wsprintfA(value, " (%s\\%04d)", classes[cl], i);
+                    PpAppend(c->Name, value, sizeof(c->Name));
+                    PpCtlCount++;
+                }
+                RegCloseKey(k);
+            }
+        }
+    }
+}
+#endif
+
 /* IOCTL_SCSI_MINIPORT; the data follows the header in PpBuf (prepared by the caller) */
-static BOOL PpMiniport(HANDLE h, ULONG code, ULONG length)
+static BOOL PpMiniportSig(HANDLE h, const char *sig, ULONG code, ULONG length)
 {
     PSRB_IO_CONTROL c = (PSRB_IO_CONTROL)PpBuf;
     DWORD n;
     int i;
     c->HeaderLength = sizeof(SRB_IO_CONTROL);
-    for (i = 0; i < 8; i++) c->Signature[i] = (UCHAR)PP_SIGNATURE[i];
+    for (i = 0; i < 8; i++) c->Signature[i] = (UCHAR)sig[i];
     c->Timeout = 10;
     c->ControlCode = code;
     c->Length = length;
@@ -417,6 +566,11 @@ static BOOL PpMiniport(HANDLE h, ULONG code, ULONG length)
         return FALSE;
     }
     return c->ReturnCode == 0;
+}
+
+static BOOL PpMiniport(HANDLE h, ULONG code, ULONG length)
+{
+    return PpMiniportSig(h, PP_SIGNATURE, code, length);
 }
 
 #if defined(PP_AHCI) || defined(PP_IDE)
@@ -465,6 +619,37 @@ static BOOL PpDeviceName(ULONG path, ULONG target, char *out)
 }
 #endif
 
+/* IDENT: the PIO= items for this controller onto the device rows (a
+   channel item covers both of its devices) */
+static void PpPioFromText(PP_PAGE *pg, const char *params)
+{
+#if defined(PP_IDE)
+    static PP_ITEM items[PP_MAX_ITEMS];
+    char rest[PP_PARAM_LEN], channel[24];
+    int n, i, k;
+    n = PpSplitKey(params, "PIO=", items, PP_MAX_ITEMS, rest, sizeof(rest));
+    for (i = 0; i < pg->NumRows; i++) {
+        PP_ROW *r = &pg->Rows[i];
+        r->Pio = FALSE;
+        for (k = 0; r->Item[k] && r->Item[k] != '.'; k++) channel[k] = r->Item[k];
+        channel[k] = 0;
+        if (r->Item[k] != '.') continue;                    /* channel rows show no mode */
+        r->Pio = PpIsOff(items, n, &pg->Self, r->Item) || PpIsOff(items, n, &pg->Self, channel);
+    }
+#else
+    (void)pg; (void)params;
+#endif
+}
+
+#if defined(PP_IDE) || defined(PP_EXE)
+static BOOL PpIsDeviceRow(const PP_ROW *r)
+{
+    int k;
+    for (k = 0; r->Item[k]; k++) if (r->Item[k] == '.') return TRUE;
+    return FALSE;
+}
+#endif
+
 static PP_ROW *PpRow(PP_PAGE *pg, const char *item, const char *label)
 {
     PP_ROW *r;
@@ -478,6 +663,7 @@ static PP_ROW *PpRow(PP_PAGE *pg, const char *item, const char *label)
     lstrcpyA(r->Label, label);
     r->Desc[0] = 0;
     r->On = TRUE;
+    r->Pio = FALSE;
     return r;
 }
 
@@ -679,8 +865,35 @@ static void PpCollect(PP_PAGE *pg)
     }
 #endif
 
+#ifdef PP_EXE
+    /* 9x (or a controller that does not answer): the usual items */
+    if (!pg->Opened) {
+#if defined(PP_AHCI)
+        ULONG k;
+        for (k = 0; k < 6; k++) {
+            wsprintfA(item, "%lu", k);
+            wsprintfA(label, "Port %lu", k);
+            PpRow(pg, item, label);
+        }
+#elif defined(PP_IDE)
+        PpRow(pg, "0", "Primary channel");
+        PpRow(pg, "0.0", "    Master");
+        PpRow(pg, "0.1", "    Slave");
+        PpRow(pg, "1", "Secondary channel");
+        PpRow(pg, "1.0", "    Master");
+        PpRow(pg, "1.1", "    Slave");
+#elif defined(PP_NVME)
+        PpRow(pg, "1", "Namespace 1");
+#else
+        PpRow(pg, "0", "Slot 0");
+        PpRow(pg, "1", "Slot 1");
+#endif
+    }
+#endif
+
     if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
     PpSortRows(pg);
+    PpPioFromText(pg, pg->Params);
     for (i = 0; i < pg->NumRows; i++) {
         pg->Rows[i].On = !PpIsOff(items, n, &pg->Self, pg->Rows[i].Item);
         if (!pg->Rows[i].On && (pg->Rows[i].Desc[0] == 0 || lstrcmpA(pg->Rows[i].Desc, "(no device)") == 0 ||
@@ -696,13 +909,18 @@ static void PpCollect(PP_PAGE *pg)
 
 #define PP_KEY "SYSTEM\\CurrentControlSet\\Services\\" PP_SERVICE "\\Parameters\\Device"
 
+/* Where the parameter string is: DriverParameters of the service (NT
+   family), or AdapterSettings of the controller's driver key (9x) */
+static char PpKeyPath[160] = PP_KEY;
+static const char *PpValueName = "DriverParameters";
+
 static void PpReadParams(char *out, int size)
 {
     HKEY k;
     DWORD type, n = (DWORD)size - 1;
     out[0] = 0;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, PP_KEY, 0, KEY_READ, &k) != ERROR_SUCCESS) return;
-    if (RegQueryValueExA(k, "DriverParameters", NULL, &type, (LPBYTE)out, &n) != ERROR_SUCCESS || type != REG_SZ) n = 0;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, PpKeyPath, 0, KEY_READ, &k) != ERROR_SUCCESS) return;
+    if (RegQueryValueExA(k, PpValueName, NULL, &type, (LPBYTE)out, &n) != ERROR_SUCCESS || type != REG_SZ) n = 0;
     out[n < (DWORD)size ? n : (DWORD)size - 1] = 0;
     RegCloseKey(k);
 }
@@ -710,11 +928,11 @@ static void PpReadParams(char *out, int size)
 static LONG PpWriteParams(const char *params)
 {
     HKEY k;
-    LONG r = RegCreateKeyExA(HKEY_LOCAL_MACHINE, PP_KEY, 0, NULL, 0, KEY_READ | KEY_WRITE, NULL, &k, NULL);
+    LONG r = RegCreateKeyExA(HKEY_LOCAL_MACHINE, PpKeyPath, 0, NULL, 0, KEY_READ | KEY_WRITE, NULL, &k, NULL);
     if (r != ERROR_SUCCESS) return r;
-    if (params[0]) r = RegSetValueExA(k, "DriverParameters", 0, REG_SZ, (const BYTE *)params, lstrlenA(params) + 1);
+    if (params[0]) r = RegSetValueExA(k, PpValueName, 0, REG_SZ, (const BYTE *)params, lstrlenA(params) + 1);
     else {
-        r = RegDeleteValueA(k, "DriverParameters");
+        r = RegDeleteValueA(k, PpValueName);
         if (r == ERROR_FILE_NOT_FOUND) r = ERROR_SUCCESS;
     }
     RegCloseKey(k);
@@ -729,9 +947,57 @@ static void PpParamsFromRows(PP_PAGE *pg, const char *current, char *out, int si
     for (i = 0; i < pg->NumRows; i++) {
         if (!pg->Rows[i].On) lstrcpyA(off[n++], pg->Rows[i].Item);
     }
-    PpRebuild(current, &pg->Self, pg->Others, pg->NumOthers, off, n, out, size);
+    PpRebuildKey("OFF=", current, &pg->Self, pg->Others, pg->NumOthers, off, n, out, size);
+#if defined(PP_IDE)
+    {
+        static char pio[PP_MAX_ROWS][24];
+        char tmp[PP_PARAM_LEN];
+        lstrcpyA(tmp, out);
+        n = 0;
+        for (i = 0; i < pg->NumRows; i++) {
+            if (pg->Rows[i].Pio && PpIsDeviceRow(&pg->Rows[i])) lstrcpyA(pio[n++], pg->Rows[i].Item);
+        }
+        PpRebuildKey("PIO=", tmp, &pg->Self, pg->Others, pg->NumOthers, pio, n, out, size);
+    }
+#endif
 }
 
+/* Scripted tests: "item,item,..." turned off, "pitem" PIO only, "-" none */
+static void PpApplyTestItems(PP_PAGE *pg, const char *p)
+{
+    int k;
+    for (k = 0; k < pg->NumRows; k++) {
+        pg->Rows[k].On = TRUE;
+        pg->Rows[k].Pio = FALSE;
+    }
+    while (*p && *p != '-') {
+        char body[24];
+        int n = 0;
+        BOOL pio = FALSE;
+        if (*p == 'p' || *p == 'P') { pio = TRUE; p++; }
+        while (*p && *p != ',' && *p != '+' && *p != ' ' && n < 23) body[n++] = *p++;
+        body[n] = 0;
+        for (k = 0; k < pg->NumRows; k++) {
+            if (lstrcmpA(pg->Rows[k].Item, body) != 0) continue;
+            if (pio) pg->Rows[k].Pio = TRUE;
+            else pg->Rows[k].On = FALSE;
+        }
+        if (*p == ',' || *p == '+') p++;
+        else break;
+    }
+}
+
+static const char *PpModeText(const PP_ROW *r)
+{
+#if defined(PP_IDE)
+    if (PpIsDeviceRow(r)) return r->Pio ? "PIO only" : "DMA";
+#else
+    (void)r;
+#endif
+    return "";
+}
+
+#ifndef PP_EXE
 static void PpInit(PP_PAGE *pg)
 {
     PpLocation(pg->Set, &pg->Dev, &pg->Self);
@@ -739,11 +1005,13 @@ static void PpInit(PP_PAGE *pg)
     PpReadParams(pg->Params, sizeof(pg->Params));
     PpCollect(pg);
 }
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Page                                                                */
 /* ------------------------------------------------------------------ */
 
+#ifndef PP_EXE
 static void PpFillList(PP_PAGE *pg)
 {
     LVITEMA it;
@@ -759,6 +1027,11 @@ static void PpFillList(PP_PAGE *pg)
         it.iSubItem = 1;
         it.pszText = pg->Rows[i].Desc;
         SendMessageA(pg->List, LVM_SETITEMTEXTA, i, (LPARAM)&it);
+#if defined(PP_IDE)
+        it.iSubItem = 2;
+        it.pszText = (LPSTR)PpModeText(&pg->Rows[i]);
+        SendMessageA(pg->List, LVM_SETITEMTEXTA, i, (LPARAM)&it);
+#endif
         it.mask = LVIF_STATE;
         it.iSubItem = 0;
         it.stateMask = LVIS_STATEIMAGEMASK;
@@ -777,9 +1050,16 @@ static void PpRowsFromText(PP_PAGE *pg)
     GetWindowTextA(pg->Edit, pg->Params, sizeof(pg->Params));
     n = PpSplit(pg->Params, items, PP_MAX_ITEMS, rest, sizeof(rest));
     pg->Updating = TRUE;
+    PpPioFromText(pg, pg->Params);
     for (i = 0; i < pg->NumRows; i++) {
         LVITEMA it;
         BOOL on = !PpIsOff(items, n, &pg->Self, pg->Rows[i].Item);
+#if defined(PP_IDE)
+        memset(&it, 0, sizeof(it));
+        it.iSubItem = 2;
+        it.pszText = (LPSTR)PpModeText(&pg->Rows[i]);
+        SendMessageA(pg->List, LVM_SETITEMTEXTA, i, (LPARAM)&it);
+#endif
         if (on == pg->Rows[i].On) continue;
         pg->Rows[i].On = on;
         memset(&it, 0, sizeof(it));
@@ -789,6 +1069,8 @@ static void PpRowsFromText(PP_PAGE *pg)
     }
     pg->Updating = FALSE;
 }
+
+#endif
 
 static HWND PpControl(HWND dlg, const char *cls, const char *text, DWORD style, DWORD exStyle,
                       int x, int y, int cx, int cy, int id)
@@ -805,12 +1087,16 @@ static HWND PpControl(HWND dlg, const char *cls, const char *text, DWORD style, 
 }
 
 static const char PpNote[] =
+#ifdef PP_EXE
+    "Select a line and press Turn on / off (or double-click it); [X] is on. "
+#endif
 #if defined(PP_AHCI)
     "Clear a port to turn it off: AHCINT then leaves it alone (no reset, no commands, "
     "its interrupts disabled) and its disk disappears."
 #elif defined(PP_IDE)
     "Clear a channel or a device to turn it off: IDENT then leaves it alone (no reset, "
-    "no commands) and its disk or drive disappears."
+    "no commands) and its disk or drive disappears. DMA / PIO switches a device to PIO "
+    "only (PIO=)."
 #elif defined(PP_NVME)
     "Clear a namespace to leave it out: NVMENT then presents no disk for it; the other "
     "namespaces move up."
@@ -818,9 +1104,15 @@ static const char PpNote[] =
     "Clear a slot to turn it off: MMCSDNT then sets up no card in it and disables its "
     "interrupts."
 #endif
+#ifdef PP_EXE
+    " The change is stored as OFF= in the driver parameters below and takes effect when "
+    "Windows is started the next time.";
+#else
     " The change is stored as OFF= in the driver parameters below and takes effect when "
     "the controller restarts (for the controller of the system disk: at the next boot).";
+#endif
 
+#ifndef PP_EXE
 static INT_PTR CALLBACK PpDialog(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
 {
     PP_PAGE *pg = (PP_PAGE *)GetWindowLongPtrA(dlg, DWLP_USER);
@@ -844,11 +1136,23 @@ static INT_PTR CALLBACK PpDialog(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageA(pg->List, LVM_INSERTCOLUMNA, 0, (LPARAM)&col);
         col.pszText = (LPSTR)(pg->Opened ? "Device" : "Device (controller not running)");
         col.cx = (rc.right - rc.left) - col.cx - GetSystemMetrics(SM_CXVSCROLL);
+#if defined(PP_IDE)
+        col.cx -= (rc.right - rc.left) / 6;
+#endif
         SendMessageA(pg->List, LVM_INSERTCOLUMNA, 1, (LPARAM)&col);
+#if defined(PP_IDE)
+        col.pszText = (LPSTR)"Mode";
+        col.cx = (rc.right - rc.left) / 6;
+        SendMessageA(pg->List, LVM_INSERTCOLUMNA, 2, (LPARAM)&col);
+        PpControl(dlg, "BUTTON", "&DMA / PIO", BS_PUSHBUTTON | WS_TABSTOP, 0, 7, 171, 60, 14, IDC_PIO);
+#define PP_PARAMS_Y 190
+#else
+#define PP_PARAMS_Y 174
+#endif
         PpControl(dlg, "STATIC", "Driver parameters (" PP_SERVICE ", all controllers):", 0, 0,
-                  7, 174, 238, 9, IDC_PLABEL);
+                  7, PP_PARAMS_Y, 238, 9, IDC_PLABEL);
         pg->Edit = PpControl(dlg, "EDIT", pg->Params, ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
-                             7, 185, 238, 13, IDC_PARAMS);
+                             7, PP_PARAMS_Y + 11, 238, 13, IDC_PARAMS);
         SendMessageA(pg->Edit, EM_LIMITTEXT, PP_PARAM_LEN - 1, 0);
         PpFillList(pg);
         return TRUE;
@@ -858,6 +1162,26 @@ static INT_PTR CALLBACK PpDialog(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
             PpRowsFromText(pg);
             PropSheet_Changed(GetParent(dlg), dlg);
         }
+#if defined(PP_IDE)
+        if (pg && LOWORD(wp) == IDC_PIO && HIWORD(wp) == BN_CLICKED) {
+            int i = (int)SendMessageA(pg->List, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
+            if (i >= 0 && i < pg->NumRows && PpIsDeviceRow(&pg->Rows[i])) {
+                char text[PP_PARAM_LEN];
+                LVITEMA it;
+                pg->Rows[i].Pio = !pg->Rows[i].Pio;
+                memset(&it, 0, sizeof(it));
+                it.iSubItem = 2;
+                it.pszText = (LPSTR)PpModeText(&pg->Rows[i]);
+                SendMessageA(pg->List, LVM_SETITEMTEXTA, i, (LPARAM)&it);
+                GetWindowTextA(pg->Edit, pg->Params, sizeof(pg->Params));
+                PpParamsFromRows(pg, pg->Params, text, sizeof(text));
+                pg->Updating = TRUE;
+                SetWindowTextA(pg->Edit, text);
+                pg->Updating = FALSE;
+                PropSheet_Changed(GetParent(dlg), dlg);
+            }
+        }
+#endif
         break;
     case WM_NOTIFY: {
         LPNMHDR h = (LPNMHDR)lp;
@@ -978,8 +1302,9 @@ __declspec(dllexport) BOOL WINAPI PortPageProvider(PSP_PROPSHEETPAGE_REQUEST req
  * rundll32 <dll>,PortPageTest <n> <out file> [items]
  * Controller n of the driver (0 = first present one): writes the rows and
  * the parameter string to the file. With items (OFF= bodies separated
- * by commas or plus signs, or "-" for none) the rows are set to exactly those turned off
- * and the resulting string is written to the registry.
+ * by commas or plus signs, a "p" in front for PIO only (IDENT), or "-"
+ * for none) the rows are set to exactly those and the resulting string is
+ * written to the registry.
  */
 static void PpOut(HANDLE f, const char *s)
 {
@@ -1031,24 +1356,13 @@ __declspec(dllexport) void CALLBACK PortPageTest(HWND w, HINSTANCE inst, LPSTR c
               pg.Opened ? "open" : "NOT OPEN", pg.NumOthers, pg.Params);
     PpOut(f, line);
     for (k = 0; k < pg.NumRows; k++) {
-        wsprintfA(line, "[%c] %-6s %s | %s\r\n", pg.Rows[k].On ? 'x' : ' ', pg.Rows[k].Item,
-                  pg.Rows[k].Label, pg.Rows[k].Desc);
+        wsprintfA(line, "[%c] %-6s %s | %s %s\r\n", pg.Rows[k].On ? 'x' : ' ', pg.Rows[k].Item,
+                  pg.Rows[k].Label, pg.Rows[k].Desc, PpModeText(&pg.Rows[k]));
         PpOut(f, line);
     }
     if (*p) {
         char text[PP_PARAM_LEN];
-        for (k = 0; k < pg.NumRows; k++) pg.Rows[k].On = TRUE;
-        while (*p && *p != '-') {
-            char body[24];
-            int n = 0;
-            while (*p && *p != ',' && *p != '+' && *p != ' ' && n < 23) body[n++] = *p++;
-            body[n] = 0;
-            for (k = 0; k < pg.NumRows; k++) {
-                if (lstrcmpA(pg.Rows[k].Item, body) == 0) pg.Rows[k].On = FALSE;
-            }
-            if (*p == ',' || *p == '+') p++;
-            else break;
-        }
+        PpApplyTestItems(&pg, p);
         PpParamsFromRows(&pg, pg.Params, text, sizeof(text));
         wsprintfA(line, "new [%s] write %ld\r\n", text, PpWriteParams(text));
         PpOut(f, line);
@@ -1066,3 +1380,468 @@ BOOL WINAPI DllMainCRTStartup(HINSTANCE inst, DWORD reason, LPVOID reserved)
     }
     return TRUE;
 }
+#endif
+
+#ifdef PP_EXE
+/* ------------------------------------------------------------------ */
+/* Program (PP_EXE)                                                    */
+/* ------------------------------------------------------------------ */
+
+#define IDC_CTL         110
+#define IDC_TOGGLE      111
+#define IDC_SAVE        112
+
+static PP_PAGE PpPg;
+static int PpSel = -1;
+static BOOL PpDirty;
+
+static void PpInitExe(PP_PAGE *pg, int index)
+{
+    HWND list = pg->List, edit = pg->Edit;
+    int i;
+    memset(pg, 0, sizeof(*pg));
+    pg->List = list;
+    pg->Edit = edit;
+    pg->Port = PpCtl[index].Port;
+    pg->Self = PpCtl[index].Loc;
+    for (i = 0; i < PpCtlCount; i++) {
+        if (i != index && pg->NumOthers < PP_MAX_OTHERS) pg->Others[pg->NumOthers++] = PpCtl[i].Loc;
+    }
+    if (Pp9x) {
+        lstrcpyA(PpKeyPath, PpCtl[index].Key);
+        PpValueName = "AdapterSettings";
+    }
+    PpReadParams(pg->Params, sizeof(pg->Params));
+    PpCollect(pg);
+}
+
+static void PpListText(const PP_ROW *r, char *out)
+{
+    const char *mode = PpModeText(r);
+    wsprintfA(out, mode[0] ? "[%c]  %s\t%s  (%s)" : "[%c]  %s\t%s", r->On ? 'X' : ' ', r->Label, r->Desc, mode);
+}
+
+static void PpExeFill(HWND dlg)
+{
+    char line[256];
+    int i, sel = (int)SendMessageA(PpPg.List, LB_GETCURSEL, 0, 0);
+    SendMessageA(PpPg.List, LB_RESETCONTENT, 0, 0);
+    for (i = 0; i < PpPg.NumRows; i++) {
+        PpListText(&PpPg.Rows[i], line);
+        SendMessageA(PpPg.List, LB_ADDSTRING, 0, (LPARAM)line);
+    }
+    if (sel >= 0 && sel < PpPg.NumRows) SendMessageA(PpPg.List, LB_SETCURSEL, sel, 0);
+    (void)dlg;
+}
+
+static void PpExeSelect(HWND dlg, int index)
+{
+    PpSel = index;
+    PpInitExe(&PpPg, index);
+    PpPg.Updating = TRUE;
+    SetWindowTextA(PpPg.Edit, PpPg.Params);
+    PpPg.Updating = FALSE;
+    PpExeFill(dlg);
+    PpDirty = FALSE;
+}
+
+/* Check marks from the text in the edit box */
+static void PpExeRowsFromText(HWND dlg)
+{
+    static PP_ITEM items[PP_MAX_ITEMS];
+    char rest[PP_PARAM_LEN];
+    int n, i;
+    GetWindowTextA(PpPg.Edit, PpPg.Params, sizeof(PpPg.Params));
+    n = PpSplit(PpPg.Params, items, PP_MAX_ITEMS, rest, sizeof(rest));
+    for (i = 0; i < PpPg.NumRows; i++) PpPg.Rows[i].On = !PpIsOff(items, n, &PpPg.Self, PpPg.Rows[i].Item);
+    PpPioFromText(&PpPg, PpPg.Params);
+    PpExeFill(dlg);
+}
+
+static void PpExeToggle(HWND dlg, BOOL Pio)
+{
+    char text[PP_PARAM_LEN];
+    int i = (int)SendMessageA(PpPg.List, LB_GETCURSEL, 0, 0);
+    if (i < 0 || i >= PpPg.NumRows) return;
+    if (Pio) {
+        if (!PpIsDeviceRow(&PpPg.Rows[i])) return;
+        PpPg.Rows[i].Pio = !PpPg.Rows[i].Pio;
+    } else {
+        PpPg.Rows[i].On = !PpPg.Rows[i].On;
+    }
+    GetWindowTextA(PpPg.Edit, PpPg.Params, sizeof(PpPg.Params));
+    PpParamsFromRows(&PpPg, PpPg.Params, text, sizeof(text));
+    PpPg.Updating = TRUE;
+    SetWindowTextA(PpPg.Edit, text);
+    PpPg.Updating = FALSE;
+    PpExeFill(dlg);
+    PpDirty = TRUE;
+}
+
+static BOOL PpExeSave(HWND dlg)
+{
+    char text[PP_PARAM_LEN], m[200];
+    LONG r;
+    GetWindowTextA(PpPg.Edit, text, sizeof(text));
+    r = PpWriteParams(text);
+    if (r != ERROR_SUCCESS) {
+        wsprintfA(m, "The driver parameters could not be written (error %ld).", r);
+        MessageBoxA(dlg, m, PP_SERVICE, MB_OK | MB_ICONSTOP);
+        return FALSE;
+    }
+    PpDirty = FALSE;
+    MessageBoxA(dlg, "Stored. The change takes effect when Windows is restarted.", PP_SERVICE, MB_OK | MB_ICONINFORMATION);
+    return TRUE;
+}
+
+static BOOL PpExeKeep(HWND dlg)
+{
+    int r;
+    if (!PpDirty) return TRUE;
+    r = MessageBoxA(dlg, "Store the changed driver parameters?", PP_SERVICE, MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (r == IDCANCEL) return FALSE;
+    if (r == IDYES) return PpExeSave(dlg);
+    return TRUE;
+}
+
+static BOOL CALLBACK PpExeDialog(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    (void)lp;
+    switch (msg) {
+    case WM_INITDIALOG: {
+        HWND combo;
+        int tabs[1], i;
+        char label[96];
+        PpPg.Updating = TRUE;
+        PpControl(dlg, "STATIC", PpNote, 0, 0, 7, 7, 270, 44, IDC_NOTE);
+        PpControl(dlg, "STATIC", "Controller:", 0, 0, 7, 54, 44, 9, -1);
+        combo = PpControl(dlg, "COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 52, 52, 225, 80, IDC_CTL);
+        for (i = 0; i < PpCtlCount; i++) SendMessageA(combo, CB_ADDSTRING, 0, (LPARAM)PpCtl[i].Name);
+        PpPg.List = PpControl(dlg, "LISTBOX", "", LBS_NOTIFY | LBS_USETABSTOPS | WS_VSCROLL | WS_BORDER | WS_TABSTOP,
+                              0, 7, 70, 270, 100, IDC_LIST);
+        tabs[0] = 110;
+        SendMessageA(PpPg.List, LB_SETTABSTOPS, 1, (LPARAM)tabs);
+        PpControl(dlg, "BUTTON", "&Turn on / off", BS_PUSHBUTTON | WS_TABSTOP, 0, 7, 172, 70, 14, IDC_TOGGLE);
+#if defined(PP_IDE)
+        PpControl(dlg, "BUTTON", "&DMA / PIO", BS_PUSHBUTTON | WS_TABSTOP, 0, 82, 172, 70, 14, IDC_PIO);
+#endif
+        wsprintfA(label, "Driver parameters (%s):", Pp9x ? "AdapterSettings of this controller"
+                                                         : PP_SERVICE ", all controllers");
+        PpControl(dlg, "STATIC", label, 0, 0, 7, 192, 270, 9, IDC_PLABEL);
+        PpPg.Edit = PpControl(dlg, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 0, 7, 203, 270, 13, IDC_PARAMS);
+        SendMessageA(PpPg.Edit, EM_LIMITTEXT, PP_PARAM_LEN - 1, 0);
+        PpControl(dlg, "BUTTON", "&Store", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 166, 222, 52, 14, IDC_SAVE);
+        PpControl(dlg, "BUTTON", "Close", BS_PUSHBUTTON | WS_TABSTOP, 0, 225, 222, 52, 14, IDCANCEL);
+        PpPg.Updating = FALSE;
+        if (PpCtlCount > 0) {
+            SendMessageA(combo, CB_SETCURSEL, 0, 0);
+            PpExeSelect(dlg, 0);
+        } else {
+            SendMessageA(PpPg.List, LB_ADDSTRING, 0, (LPARAM)"No " PP_SERVICE " controller was found.");
+            EnableWindow(PpPg.Edit, FALSE);
+        }
+        return TRUE;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDC_CTL:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                int i = (int)SendMessageA((HWND)lp, CB_GETCURSEL, 0, 0);
+                if (i != PpSel && i >= 0) {
+                    if (!PpExeKeep(dlg)) SendMessageA((HWND)lp, CB_SETCURSEL, PpSel, 0);
+                    else PpExeSelect(dlg, i);
+                }
+            }
+            break;
+        case IDC_LIST:
+            if (HIWORD(wp) == LBN_DBLCLK && PpSel >= 0) PpExeToggle(dlg, FALSE);
+            break;
+        case IDC_TOGGLE:
+            if (PpSel >= 0) PpExeToggle(dlg, FALSE);
+            break;
+        case IDC_PIO:
+            if (PpSel >= 0) PpExeToggle(dlg, TRUE);
+            break;
+        case IDC_PARAMS:
+            if (HIWORD(wp) == EN_CHANGE && !PpPg.Updating && PpSel >= 0) {
+                PpExeRowsFromText(dlg);
+                PpDirty = TRUE;
+            }
+            break;
+        case IDC_SAVE:
+            if (PpSel >= 0) PpExeSave(dlg);
+            break;
+        case IDCANCEL:
+            if (PpSel < 0 || PpExeKeep(dlg)) EndDialog(dlg, 0);
+            break;
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* The dialog: no controls in the template, MS Sans Serif (every system
+   from NT 3.1 and 95 has it) */
+#ifdef _MSC_VER
+#define PP_ALIGN4 __declspec(align(4))
+#else
+#define PP_ALIGN4 __attribute__((aligned(4)))
+#endif
+static PP_ALIGN4 WORD PpExeTemplate[] = {
+    /* DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE */
+    0x00C0, 0x90C8, 0x0000, 0x0000,
+    0,
+    0, 0, 284, 244,
+    0, 0,
+    'P', 'o', 'r', 't', 's', 0,
+    8,
+    'M', 'S', ' ', 'S', 'a', 'n', 's', ' ', 'S', 'e', 'r', 'i', 'f', 0
+};
+
+static void PpOut(HANDLE f, const char *s)
+{
+    DWORD n;
+    WriteFile(f, s, lstrlenA(s), &n, NULL);
+}
+
+#if defined(PP_NVME)
+/* One admin command through NvmeMini: Command[] as given, data of Len
+   bytes after the structure, Dir 0 none, 1 to the controller, 2 from it.
+   The NVMe status (0 = success) is returned, FFFFh when the driver did
+   not take the command. */
+static ULONG PpNvmeAdmin(HANDLE h, ULONG opc, ULONG nsid, ULONG cdw10, ULONG cdw11, ULONG dir, ULONG len, ULONG *dw0)
+{
+    UCHAR *pt = PpBuf + sizeof(SRB_IO_CONTROL);
+    ULONG *cmd = (ULONG *)(pt + 24);
+    ULONG st;
+    cmd[0] = opc;
+    cmd[1] = nsid;
+    cmd[10] = cdw10;
+    cmd[11] = cdw11;
+    *(ULONG *)(pt + 104) = dir;
+    *(ULONG *)(pt + 112) = len;
+    *(ULONG *)(pt + 120) = 124 + len;
+    *(ULONG *)(pt + 100) = 0;
+    st = PpMiniport(h, 0, 124 + 4096) ? 0 : 0xFFFF;
+    if (PpGet32(pt + 88 + 12) != 0) st = (PpGet32(pt + 88 + 12) >> 17) & 0x7FFF;
+    if (dw0 != NULL) *dw0 = PpGet32(pt + 88);
+    return st;
+}
+
+static void PpNvmeClear(void)
+{
+    memset(PpBuf, 0, sizeof(SRB_IO_CONTROL) + 124 + 4096);
+}
+
+/* <exe> /ns <n> <out file> list | create <MB> [format] | delete <nsid> |
+   attach <nsid> | detach <nsid> | format <nsid> [format]
+   Namespace administration of NVMe controller n (the driver needs
+   ADMIN=1 for all but list) */
+static void PpExeNs(const char *p)
+{
+    const char *e;
+    char file[MAX_PATH], line[256], act[16], size[32];
+    UCHAR *data = PpBuf + sizeof(SRB_IO_CONTROL) + 124;
+    HANDLE f, h;
+    ULONG index, arg1 = 0, arg2 = 0, st, dw0 = 0, k, cntlid, oacs, nn;
+    int n;
+    BOOL has2;
+
+    while (*p == ' ') p++;
+    index = PpNumber(p, &e);
+    p = e;
+    while (*p == ' ') p++;
+    for (n = 0; *p && *p != ' ' && n < MAX_PATH - 1; n++) file[n] = *p++;
+    file[n] = 0;
+    while (*p == ' ') p++;
+    for (n = 0; *p && *p != ' ' && n < 15; n++) act[n] = *p++;
+    act[n] = 0;
+    while (*p == ' ') p++;
+    arg1 = PpNumber(p, &e);
+    p = e;
+    while (*p == ' ') p++;
+    has2 = (BOOL)(*p >= '0' && *p <= '9');
+    if (has2) arg2 = PpNumber(p, NULL);
+    f = CreateFileA(file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    if ((int)index >= PpCtlCount) {
+        PpOut(f, "no controller\r\n");
+        CloseHandle(f);
+        return;
+    }
+    PpInitExe(&PpPg, (int)index);
+    h = PpOpenAdapter(&PpPg);
+    if (h == INVALID_HANDLE_VALUE) {
+        PpOut(f, "controller not open\r\n");
+        CloseHandle(f);
+        return;
+    }
+    PpNvmeClear();
+    if (PpNvmeAdmin(h, 0x06, 0, 1, 0, 2, 4096, NULL) != 0) {
+        PpOut(f, "Identify Controller failed\r\n");
+        CloseHandle(h);
+        CloseHandle(f);
+        return;
+    }
+    cntlid = data[78] | (data[79] << 8);
+    oacs = data[256] | (data[257] << 8);
+    nn = PpGet32(data + 516);
+    if (lstrcmpiA(act, "list") == 0) {
+        static ULONG ids[1024];
+        ULONG count = 0, active[64], na = 0;
+        PpFormatSize(size, (ULONGLONG)PpGet32(data + 280) | ((ULONGLONG)PpGet32(data + 284) << 32));
+        wsprintfA(line, "controller %lu, %lu namespace(s) at most, namespace management %s, capacity %s",
+                  cntlid, nn, (oacs & 8) ? "yes" : "no", size);
+        PpOut(f, line);
+        PpFormatSize(size, (ULONGLONG)PpGet32(data + 296) | ((ULONGLONG)PpGet32(data + 300) << 32));
+        wsprintfA(line, ", unallocated %s\r\n", size);
+        PpOut(f, line);
+        PpNvmeClear();
+        if (PpNvmeAdmin(h, 0x06, 0, 2, 0, 2, 4096, NULL) == 0) {
+            for (k = 0; k < 64 && PpGet32(data + k * 4) != 0; k++) active[na++] = PpGet32(data + k * 4);
+        }
+        PpNvmeClear();
+        if ((oacs & 8) && PpNvmeAdmin(h, 0x06, 0, 0x10, 0, 2, 4096, NULL) == 0) {
+            for (k = 0; k < 1024 && PpGet32(data + k * 4) != 0; k++) ids[count++] = PpGet32(data + k * 4);
+        } else {
+            for (k = 0; k < na; k++) ids[count++] = active[k];
+        }
+        for (k = 0; k < count; k++) {
+            ULONG a, j;
+            UCHAR fmt, lbads;
+            ULONGLONG blocks;
+            for (a = 0, j = 0; j < na; j++) if (active[j] == ids[k]) a = 1;
+            PpNvmeClear();
+            if (PpNvmeAdmin(h, 0x06, ids[k], a ? 0 : 0x11, 0, 2, 4096, NULL) != 0) {
+                wsprintfA(line, "namespace %lu: no data\r\n", ids[k]);
+            } else {
+                blocks = (ULONGLONG)PpGet32(data) | ((ULONGLONG)PpGet32(data + 4) << 32);
+                fmt = (UCHAR)(data[26] & 0x0F);
+                lbads = data[128 + fmt * 4 + 2];
+                PpFormatSize(size, blocks << lbads);
+                wsprintfA(line, "namespace %lu: %s, format %lu (%lu-byte blocks, %lu metadata), %s\r\n", ids[k], size,
+                          (ULONG)fmt, 1ul << lbads, (ULONG)(data[128 + fmt * 4] | (data[129 + fmt * 4] << 8)),
+                          a ? "attached" : "not attached");
+            }
+            PpOut(f, line);
+        }
+    } else if (lstrcmpiA(act, "create") == 0) {
+        UCHAR fmt = (UCHAR)(has2 ? arg2 : 0), lbads;
+        ULONGLONG blocks;
+        PpNvmeClear();
+        /* block size of the format: from the common namespace data, or a namespace's */
+        if (PpNvmeAdmin(h, 0x06, 0xFFFFFFFF, 0, 0, 2, 4096, NULL) != 0) {
+            PpNvmeClear();
+            PpNvmeAdmin(h, 0x06, 1, 0, 0, 2, 4096, NULL);
+        }
+        lbads = data[128 + fmt * 4 + 2];
+        if (lbads < 9 || lbads > 16) lbads = 9;
+        blocks = ((ULONGLONG)arg1 << 20) >> lbads;
+        PpNvmeClear();
+        *(ULONG *)(data + 0) = (ULONG)blocks;
+        *(ULONG *)(data + 4) = (ULONG)(blocks >> 32);
+        *(ULONG *)(data + 8) = (ULONG)blocks;
+        *(ULONG *)(data + 12) = (ULONG)(blocks >> 32);
+        data[26] = fmt;
+        st = PpNvmeAdmin(h, 0x0D, 0, 0, 0, 1, 4096, &dw0);
+        if (st == 0) wsprintfA(line, "created namespace %lu (%lu MB, format %lu)\r\n", dw0, arg1, (ULONG)fmt);
+        else wsprintfA(line, "create failed, status %04lX\r\n", st);
+        PpOut(f, line);
+    } else if (lstrcmpiA(act, "delete") == 0 || lstrcmpiA(act, "attach") == 0 || lstrcmpiA(act, "detach") == 0 ||
+               lstrcmpiA(act, "format") == 0) {
+        PpNvmeClear();
+        if (lstrcmpiA(act, "delete") == 0) {
+            st = PpNvmeAdmin(h, 0x0D, arg1, 1, 0, 0, 0, NULL);
+        } else if (lstrcmpiA(act, "format") == 0) {
+            st = PpNvmeAdmin(h, 0x80, arg1, has2 ? (arg2 & 0x0F) : 0, 0, 0, 0, NULL);
+        } else {
+            data[0] = 1;
+            data[2] = (UCHAR)cntlid;
+            data[3] = (UCHAR)(cntlid >> 8);
+            st = PpNvmeAdmin(h, 0x15, arg1, lstrcmpiA(act, "detach") == 0 ? 1 : 0, 0, 1, 4096, NULL);
+        }
+        if (st == 0) wsprintfA(line, "%s namespace %lu: done\r\n", act, arg1);
+        else if (st == 0xFFFF) wsprintfA(line, "%s namespace %lu: not taken by the driver (ADMIN=1 needed)\r\n", act, arg1);
+        else wsprintfA(line, "%s namespace %lu: failed, status %04lX\r\n", act, arg1, st);
+        PpOut(f, line);
+    } else {
+        PpOut(f, "list | create <MB> [format] | delete <nsid> | attach <nsid> | detach <nsid> | format <nsid> [format]\r\n");
+    }
+    CloseHandle(h);
+    CloseHandle(f);
+}
+#endif
+
+/* <exe> /t <n> <out file> [items]: as PortPageTest */
+static void PpExeTest(const char *p)
+{
+    const char *e;
+    char file[MAX_PATH], line[512];
+    HANDLE f;
+    ULONG index;
+    int k;
+
+    while (*p == ' ') p++;
+    index = PpNumber(p, &e);
+    p = e;
+    while (*p == ' ') p++;
+    for (k = 0; *p && *p != ' ' && k < MAX_PATH - 1; k++) file[k] = *p++;
+    file[k] = 0;
+    while (*p == ' ') p++;
+    f = CreateFileA(file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    for (k = 0; k < PpCtlCount; k++) {
+        wsprintfA(line, "%d: %s\r\n", k, PpCtl[k].Name);
+        PpOut(f, line);
+    }
+    if ((int)index >= PpCtlCount) {
+        PpOut(f, "no controller\r\n");
+        CloseHandle(f);
+        return;
+    }
+    PpInitExe(&PpPg, (int)index);
+    wsprintfA(line, "controller %lu: %s %lu.%lu.%lu, adapter %s, %d other(s)\r\nparams [%s]\r\n", index,
+              PpPg.Self.Pci ? "PCI" : "no PCI location", PpPg.Self.Bus, PpPg.Self.Dev, PpPg.Self.Fn,
+              PpPg.Opened ? "open" : "NOT OPEN", PpPg.NumOthers, PpPg.Params);
+    PpOut(f, line);
+    for (k = 0; k < PpPg.NumRows; k++) {
+        wsprintfA(line, "[%c] %-6s %s | %s %s\r\n", PpPg.Rows[k].On ? 'x' : ' ', PpPg.Rows[k].Item,
+                  PpPg.Rows[k].Label, PpPg.Rows[k].Desc, PpModeText(&PpPg.Rows[k]));
+        PpOut(f, line);
+    }
+    if (*p) {
+        char text[PP_PARAM_LEN];
+        PpApplyTestItems(&PpPg, p);
+        PpParamsFromRows(&PpPg, PpPg.Params, text, sizeof(text));
+        wsprintfA(line, "new [%s] write %ld\r\n", text, PpWriteParams(text));
+        PpOut(f, line);
+    }
+    CloseHandle(f);
+}
+
+void PpStart(void)
+{
+    const char *cl = GetCommandLineA();
+    PpInstance = GetModuleHandleA(NULL);
+    if (*cl == '"') {
+        cl++;
+        while (*cl && *cl != '"') cl++;
+        if (*cl) cl++;
+    } else {
+        while (*cl && *cl != ' ') cl++;
+    }
+    while (*cl == ' ') cl++;
+    PpFindControllers();
+#if defined(PP_NVME)
+    if ((cl[0] == '/' || cl[0] == '-') && (cl[1] == 'n' || cl[1] == 'N') && (cl[2] == 's' || cl[2] == 'S')) {
+        PpExeNs(cl + 3);
+    } else
+#endif
+    if ((cl[0] == '/' || cl[0] == '-') && (cl[1] == 't' || cl[1] == 'T')) {
+        PpExeTest(cl + 2);
+    } else {
+        DialogBoxIndirectParamA(PpInstance, (LPCDLGTEMPLATEA)PpExeTemplate, NULL, (DLGPROC)PpExeDialog, 0);
+    }
+    ExitProcess(0);
+}
+#endif

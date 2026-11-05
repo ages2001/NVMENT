@@ -7,7 +7,8 @@ TARGETTYPE=MINIPORT
 INCLUDES=..;$(BASEDIR)\src\storage\inc
 
 TARGETLIBS=$(BASEDIR)\lib\*\$(DDKBUILDENV)\scsiport.lib \
-           $(BASEDIR)\lib\*\$(DDKBUILDENV)\hal.lib
+           $(BASEDIR)\lib\*\$(DDKBUILDENV)\hal.lib \
+           $(BASEDIR)\lib\*\$(DDKBUILDENV)\ntoskrnl.lib
 
 SOURCES=..\nvmemain.c \
         ..\nvmecpl.c  \

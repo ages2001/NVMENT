@@ -237,19 +237,26 @@ BOOLEAN NvmeCreateIoSQ(IN PHW_DEVICE_EXTENSION DevExt)
 //
 // NvmeIdentifySync - Identify (CNS, NSID) into the utility buffer
 //
-static BOOLEAN NvmeIdentifySync(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG NamespaceId, IN ULONG CNS)
+static BOOLEAN NvmeIdentifyInto(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG NamespaceId, IN ULONG CNS,
+                                IN PVOID Buffer, IN PHYSICAL_ADDRESS BufferPhys, IN ULONG TimeoutMs)
 {
     NVME_COMMAND cmd;
 
-    memset(DevExt->UtilityBuffer, 0, NVME_PAGE_SIZE);
+    memset(Buffer, 0, NVME_PAGE_SIZE);
     memset(&cmd, 0, sizeof(NVME_COMMAND));
     cmd.CDW0.Fields.Opcode = NVME_ADMIN_IDENTIFY;
     cmd.NSID = NamespaceId;
-    cmd.PRP1 = DevExt->UtilityBufferPhys.QuadPart;
+    cmd.PRP1 = BufferPhys.QuadPart;
     cmd.PRP2 = 0;  // Single page transfer, no PRP2 needed
     cmd.CDW10 = CNS;
 
-    return NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS);
+    return NvmeAdminSync(DevExt, &cmd, TimeoutMs);
+}
+
+static BOOLEAN NvmeIdentifySync(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG NamespaceId, IN ULONG CNS)
+{
+    return NvmeIdentifyInto(DevExt, NamespaceId, CNS, DevExt->UtilityBuffer, DevExt->UtilityBufferPhys,
+                            NVMENT_ADMIN_TIMEOUT_MS);
 }
 
 //
@@ -277,8 +284,15 @@ BOOLEAN NvmeIdentifyController(IN PHW_DEVICE_EXTENSION DevExt)
 
     DevExt->NumberOfNamespaces = ctrlData->NumberOfNamespaces;
     DevExt->Oncs = ctrlData->Oncs;
+    DevExt->Oacs = ctrlData->Oacs;
+    DevExt->Oaes = *(PULONG)((PUCHAR)ctrlData + 92);
+    DevExt->Cntlid = *(PUSHORT)((PUCHAR)ctrlData + 78);
     DevExt->VwcPresent = (BOOLEAN)((ctrlData->Vwc & 1) != 0);
     DevExt->Npss = ctrlData->Npss;
+    DevExt->Hmpre = *(PULONG)((PUCHAR)ctrlData + 272);
+    DevExt->Hmmin = *(PULONG)((PUCHAR)ctrlData + 276);
+    DevExt->Hmminds = *(PULONG)((PUCHAR)ctrlData + 332);
+    DevExt->Hmmaxd = *(PUSHORT)((PUCHAR)ctrlData + 336);
 
     // Deepest non-operational power state, used for START STOP UNIT (stop)
     DevExt->IdlePowerState = 0;
@@ -329,6 +343,10 @@ BOOLEAN NvmeIdentifyController(IN PHW_DEVICE_EXTENSION DevExt)
             DevExt->MaxTransferSizeBytes = driverMaxTransfer;
         }
     }
+    // Set up again: never more than ScsiPort was told at the start
+    if (DevExt->TransferReported && DevExt->MaxTransferSizeBytes > DevExt->ReportedTransfer) {
+        DevExt->MaxTransferSizeBytes = DevExt->ReportedTransfer;
+    }
 
 #ifdef NVMENT_DBG
     ScsiDebugPrint(0, "NVMENT: Identified controller - Model: %.40s SN: %.20s FW: %.8s NN: %u\n",
@@ -344,19 +362,35 @@ BOOLEAN NvmeIdentifyController(IN PHW_DEVICE_EXTENSION DevExt)
 //
 // NvmeAddNamespace - Identify one namespace and give it the next LUN
 //
+static BOOLEAN NvmeAddNamespaceData(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG NamespaceId,
+                                    IN PNVME_IDENTIFY_NAMESPACE nsData, IN ULONG Slot);
+
 static VOID NvmeAddNamespace(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG NamespaceId)
 {
-    PNVME_IDENTIFY_NAMESPACE nsData = (PNVME_IDENTIFY_NAMESPACE)DevExt->UtilityBuffer;
-    PNVME_LUN lun;
-    UCHAR format;
-    UCHAR lbads;
-    USHORT ms;
-
     if (DevExt->LunCount >= NVMENT_MAX_LUNS) {
         return;
     }
-    if (!NvmeIdentifySync(DevExt, NamespaceId, NVME_CNS_NAMESPACE) || nsData->NamespaceSize == 0) {
+    if (!NvmeIdentifySync(DevExt, NamespaceId, NVME_CNS_NAMESPACE)) {
         return;
+    }
+    NvmeAddNamespaceData(DevExt, NamespaceId, (PNVME_IDENTIFY_NAMESPACE)DevExt->UtilityBuffer, DevExt->LunCount);
+}
+
+//
+// NvmeAddNamespaceData - Give a namespace a LUN from its Identify data: the
+// next one (Slot = LunCount), or the one it had before it went away
+//
+static BOOLEAN NvmeAddNamespaceData(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG NamespaceId,
+                                    IN PNVME_IDENTIFY_NAMESPACE nsData, IN ULONG Slot)
+{
+    PNVME_LUN lun;
+    UCHAR format;
+    UCHAR lbads;
+    USHORT ms, metaSize;
+    BOOLEAN piAct;
+
+    if (Slot >= NVMENT_MAX_LUNS || nsData->NamespaceSize == 0) {
+        return FALSE;
     }
 
     // The LBA format in use: FLBAS bits 3:0 index LBAF0..15, LBADS is log2 of the block size
@@ -369,27 +403,72 @@ static VOID NvmeAddNamespace(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG NamespaceI
                    NamespaceId, nsData->NamespaceSize, format, lbads, ms, nsData->NamespaceFeatures);
 #endif
 
-    // 512 to 4096-byte blocks; no metadata (we pass no metadata buffers)
-    if (lbads < 9 || lbads > 12 || ms != 0) {
+    // 512 to 4096-byte blocks. Metadata (MS != 0): protection information
+    // alone (MS = 8 with DPS) is inserted and stripped by the controller
+    // (PRACT); other metadata in a separate buffer (one PRP pool page per
+    // command, MS up to NVMENT_MAX_META), protection information in it
+    // generated and checked by the controller. Metadata inside the blocks
+    // (extended LBA) cannot be shown as plain blocks.
+    piAct = FALSE;
+    metaSize = 0;
+    if (ms != 0) {
+        UCHAR dps = (UCHAR)(((PUCHAR)nsData)[29] & 0x07);
+        if (nsData->FormattedLbaSize & NVME_FLBAS_EXTENDED) {
+            ms = 0xFFFF;
+        } else if (dps != 0 && ms == 8) {
+            piAct = TRUE;
+        } else if (ms <= NVMENT_MAX_META && lbads >= 9) {
+            ULONG blocks = DevExt->MaxTransferSizeBytes >> lbads;
+            metaSize = ms;
+            piAct = (BOOLEAN)(dps != 0);
+            if (blocks * ms > NVME_PAGE_SIZE) {
+                if (!DevExt->TransferReported) {
+                    // Before ScsiPort knows the limit: transfers small enough for one page
+                    DevExt->MaxTransferSizeBytes = (NVME_PAGE_SIZE / ms) << lbads;
+                } else {
+                    ms = 0xFFFF;
+                }
+            }
+        } else {
+            ms = 0xFFFF;
+        }
+    }
+    if (lbads < 9 || lbads > 12 || ms == 0xFFFF) {
 #ifdef NVMENT_DBG
         ScsiDebugPrint(0, "NVMENT: NSID %u - LBA format not supported, skipped\n", NamespaceId);
 #endif
-        return;
+        return FALSE;
     }
 
-    lun = &DevExt->Luns[DevExt->LunCount];
+    lun = &DevExt->Luns[Slot];
     lun->NamespaceId = NamespaceId;
+    lun->GoneNsid = 0;
+    lun->MetaSize = metaSize;
+    lun->PiAct = piAct;
     lun->SizeInBlocks = nsData->NamespaceSize;
     lun->BlockShift = lbads;
     lun->BlockSize = 1UL << lbads;
+    lun->LbaShift = 0;
+    // 4K=1: a namespace of 2 TB and more with 512-byte blocks is shown with
+    // 4096-byte blocks, so systems with 32-bit block addresses (READ(10),
+    // an MBR) reach up to 16 TB of it
+    if (DevExt->Sector4K && lbads == 9 && lun->SizeInBlocks >= 0x100000000ULL) {
+        lun->LbaShift = 3;
+        lun->BlockShift = 12;
+        lun->BlockSize = 4096;
+        lun->SizeInBlocks >>= 3;
+    }
     lun->Thin = (BOOLEAN)((nsData->NamespaceFeatures & NVME_NSFEAT_THIN) != 0);
     lun->NonTaggedInFlight = NULL;
-    DevExt->LunCount++;
+    if (Slot == DevExt->LunCount) {
+        DevExt->LunCount++;
+    }
 
 #ifdef NVMENT_DBG
     ScsiDebugPrint(0, "NVMENT: LUN %u = NSID %u, %u-byte blocks\n",
-                   DevExt->LunCount - 1, NamespaceId, lun->BlockSize);
+                   Slot, NamespaceId, lun->BlockSize);
 #endif
+    return TRUE;
 }
 
 //
@@ -431,6 +510,249 @@ BOOLEAN NvmeIdentifyNamespace(IN PHW_DEVICE_EXTENSION DevExt)
 
     // Keep LUN 0 usable for SMART/IOCTLs even without a namespace
     return TRUE;
+}
+
+//
+// NvmeSubmitAer - Keep one Asynchronous Event Request outstanding
+//
+VOID NvmeSubmitAer(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    NVME_COMMAND cmd;
+
+    if (!DevExt->AerOn || DevExt->AerOutstanding || DevExt->Stopped || !DevExt->InitComplete) {
+        return;
+    }
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.CDW0.Fields.Opcode = NVME_ADMIN_ASYNC_EVENT;
+    cmd.CDW0.Fields.CommandId = ADMIN_CID_AER;
+    if (NvmeSubmitCommand(DevExt, &DevExt->AdminQueue, &cmd)) {
+        DevExt->AerOutstanding = TRUE;
+    }
+}
+
+//
+// NvmeStartAer - After the controller was set up: which events it reports
+// (Asynchronous Event Configuration), then the first request. On with the
+// hot-plug check (it reads the event's log page and asks again).
+//
+VOID NvmeStartAer(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    NVME_COMMAND cmd;
+    ULONG events = 0x1F;                        // SMART / health critical warnings
+
+    DevExt->AerOutstanding = FALSE;
+    DevExt->AerLogPending = FALSE;
+    DevExt->AerOn = (BOOLEAN)(DevExt->HotPlug && !DevExt->DumpMode);
+    if (!DevExt->AerOn) {
+        return;
+    }
+    if (DevExt->Oaes & NVME_OAES_NS_ATTR) {
+        events |= 0x100;
+    }
+    if (DevExt->Oaes & NVME_OAES_FW_ACTIVATE) {
+        events |= 0x200;
+    }
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.CDW0.Fields.Opcode = NVME_ADMIN_SET_FEATURES;
+    cmd.CDW10 = NVME_FEAT_ASYNC_EVENT;
+    cmd.CDW11 = events;
+    NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS);
+    NvmeSubmitAer(DevExt);
+#ifdef NVMENT_DBG
+    ScsiDebugPrint(0, "NVMENT: asynchronous events %03X, request %s\n", events,
+                   DevExt->AerOutstanding ? "outstanding" : "not taken");
+#endif
+}
+
+//
+// NvmeAerReadLog - Timer: the log page of the last event (reading it clears
+// the event, RAE = 0), what it means for the driver, the next request
+//
+VOID NvmeAerReadLog(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    NVME_COMMAND cmd;
+    UCHAR page;
+    PUCHAR buffer;
+    ULONG bytes = (DevExt->AerLog == 0x04) ? NVME_PAGE_SIZE : 512;
+
+    page = AllocatePrpListPage(DevExt);
+    if (page == 0xFF) {
+        return;                                 // pool busy: the next check
+    }
+    buffer = (PUCHAR)GetPrpListPageVirtual(DevExt, page);
+    memset(buffer, 0, NVME_PAGE_SIZE);
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.CDW0.Fields.Opcode = NVME_ADMIN_GET_LOG_PAGE;
+    cmd.NSID = 0xFFFFFFFF;
+    cmd.PRP1 = GetPrpListPagePhysical(DevExt, page).QuadPart;
+    cmd.CDW10 = DevExt->AerLog | (((bytes / 4) - 1) << 16);
+    DevExt->AerLogPending = FALSE;
+    if (!NvmeAdminSync(DevExt, &cmd, NVMENT_HOTPLUG_ADMIN_MS) && !DevExt->SyncDone) {
+        // No answer: the page may still be written, and no further events
+        DevExt->AerOn = FALSE;
+        return;
+    }
+#ifdef NVMENT_DBG
+    ScsiDebugPrint(0, "NVMENT: event type %u info %02X log %02X\n", DevExt->AerType, DevExt->AerInfo, DevExt->AerLog);
+#endif
+    if (DevExt->AerType == NVME_AER_TYPE_NOTICE && DevExt->AerInfo == NVME_AER_NOTICE_NS_CHANGED) {
+        DevExt->NsChangePending = TRUE;
+    } else if (DevExt->AerType == NVME_AER_TYPE_SMART) {
+        DevExt->HealthWarning = buffer[0];
+    }
+    FreePrpListPage(DevExt, page);
+    NvmeSubmitAer(DevExt);
+}
+
+//
+// NvmeHotPlugNamespaces - HOTPLUG=1: the active namespace list read again
+// (into a page of the PRP list pool; the utility buffer is that pool once
+// the controller runs). A namespace that is gone keeps its LUN without a
+// namespace (requests fail); a new one gets the next free LUN, never one
+// a namespace had before. TRUE when something changed.
+//
+BOOLEAN NvmeHotPlugNamespaces(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    ULONG nsids[NVMENT_MAX_LUNS * 2];
+    ULONG count = 0, i, l, k;
+    UCHAR page;
+    PULONG buffer;
+    BOOLEAN changed = FALSE;
+
+    if (DevExt->Version < 0x00010100 || DevExt->NsListBroken) {
+        return FALSE;                           // no active namespace list
+    }
+    page = AllocatePrpListPage(DevExt);
+    if (page == 0xFF) {
+        return FALSE;                           // pool busy: the next check
+    }
+    buffer = (PULONG)GetPrpListPageVirtual(DevExt, page);
+    if (!NvmeIdentifyInto(DevExt, 0, NVME_CNS_ACTIVE_NS, buffer, GetPrpListPagePhysical(DevExt, page),
+                          NVMENT_HOTPLUG_ADMIN_MS)) {
+        if (!DevExt->SyncDone) {
+            // No answer in time: the controller may still write the page,
+            // so it stays taken, and the list is not read again
+            DevExt->NsListBroken = TRUE;
+            return FALSE;
+        }
+        FreePrpListPage(DevExt, page);
+        return FALSE;
+    }
+    while (count < NVMENT_MAX_LUNS * 2 && buffer[count] != 0) {
+        nsids[count] = buffer[count];
+        count++;
+    }
+
+    // After a format or sanitize: a namespace whose size or format changed
+    // is a new one (it gets a new LUN, as for any other namespace)
+    if (DevExt->NsRefresh) {
+        DevExt->NsRefresh = FALSE;
+        for (l = 0; l < DevExt->LunCount; l++) {
+            PNVME_LUN lun = &DevExt->Luns[l];
+            PNVME_IDENTIFY_NAMESPACE ns = (PNVME_IDENTIFY_NAMESPACE)buffer;
+            UCHAR f;
+            if (lun->NamespaceId == 0) {
+                continue;
+            }
+            if (!NvmeIdentifyInto(DevExt, lun->NamespaceId, NVME_CNS_NAMESPACE, buffer, GetPrpListPagePhysical(DevExt, page),
+                                  NVMENT_HOTPLUG_ADMIN_MS)) {
+                if (!DevExt->SyncDone) {
+                    DevExt->NsListBroken = TRUE;
+                    return changed;
+                }
+                continue;
+            }
+            f = (UCHAR)(ns->FormattedLbaSize & NVME_FLBAS_INDEX_MASK);
+            if (ns->NamespaceSize == (lun->SizeInBlocks << lun->LbaShift) &&
+                ns->LbaFormats[f].LbaDataSize == (UCHAR)(lun->BlockShift - lun->LbaShift) &&
+                ns->LbaFormats[f].MetadataSize == (lun->MetaSize != 0 ? lun->MetaSize : (lun->PiAct ? 8 : 0))) {
+                continue;
+            }
+#ifdef NVMENT_DBG
+            ScsiDebugPrint(0, "NVMENT: NSID %u changed its format (LUN %u)\n", lun->NamespaceId, l);
+#endif
+            lun->GoneNsid = lun->NamespaceId;
+            lun->GoneSize = ns->NamespaceSize + 1;     // never matches: a new LUN
+            lun->NamespaceId = 0;
+            lun->SizeInBlocks = 0;
+            changed = TRUE;
+        }
+        // the namespace list is read again into the same page below
+        if (!NvmeIdentifyInto(DevExt, 0, NVME_CNS_ACTIVE_NS, buffer, GetPrpListPagePhysical(DevExt, page),
+                              NVMENT_HOTPLUG_ADMIN_MS)) {
+            if (!DevExt->SyncDone) {
+                DevExt->NsListBroken = TRUE;
+                return changed;
+            }
+            FreePrpListPage(DevExt, page);
+            return changed;
+        }
+        count = 0;
+        while (count < NVMENT_MAX_LUNS * 2 && buffer[count] != 0) {
+            nsids[count] = buffer[count];
+            count++;
+        }
+    }
+
+    // Gone
+    for (l = 0; l < DevExt->LunCount; l++) {
+        if (DevExt->Luns[l].NamespaceId == 0) {
+            continue;
+        }
+        for (i = 0; i < count && nsids[i] != DevExt->Luns[l].NamespaceId; i++) ;
+        if (i < count) {
+            continue;
+        }
+#ifdef NVMENT_DBG
+        ScsiDebugPrint(0, "NVMENT: NSID %u gone (LUN %u)\n", DevExt->Luns[l].NamespaceId, l);
+#endif
+        DevExt->Luns[l].GoneNsid = DevExt->Luns[l].NamespaceId;
+        DevExt->Luns[l].GoneSize = DevExt->Luns[l].SizeInBlocks << DevExt->Luns[l].LbaShift;
+        DevExt->Luns[l].NamespaceId = 0;
+        DevExt->Luns[l].SizeInBlocks = 0;
+        changed = TRUE;
+    }
+
+    // New
+    for (i = 0; i < count; i++) {
+        for (l = 0; l < DevExt->LunCount && DevExt->Luns[l].NamespaceId != nsids[i]; l++) ;
+        if (l < DevExt->LunCount) {
+            continue;
+        }
+        for (k = 0; k < DevExt->NsOffCount && DevExt->NsOff[k] != nsids[i]; k++) ;
+        if (k < DevExt->NsOffCount) {
+            continue;
+        }
+        if (!NvmeIdentifyInto(DevExt, nsids[i], NVME_CNS_NAMESPACE, buffer, GetPrpListPagePhysical(DevExt, page),
+                              NVMENT_HOTPLUG_ADMIN_MS)) {
+            if (!DevExt->SyncDone) {
+                DevExt->NsListBroken = TRUE;    // see above: the page stays taken
+                return changed;
+            }
+            continue;
+        }
+        // The same namespace back (NSID and size): its old LUN (Windows 2000
+        // did not find a new LUN behind the gap the namespace left); any
+        // other one: the next LUN, never one another namespace had (all
+        // namespaces show the same INQUIRY data)
+        for (l = 0; l < DevExt->LunCount; l++) {
+            if (DevExt->Luns[l].NamespaceId == 0 && DevExt->Luns[l].GoneNsid == nsids[i] &&
+                DevExt->Luns[l].GoneSize == ((PNVME_IDENTIFY_NAMESPACE)buffer)->NamespaceSize) {
+                break;
+            }
+        }
+        if (l == DevExt->LunCount && DevExt->LunCount >= NVMENT_MAX_LUNS) {
+            continue;
+        }
+        if (NvmeAddNamespaceData(DevExt, nsids[i], (PNVME_IDENTIFY_NAMESPACE)buffer, l)) {
+#ifdef NVMENT_DBG
+            ScsiDebugPrint(0, "NVMENT: NSID %u arrived (LUN %u)\n", nsids[i], l);
+#endif
+            changed = TRUE;
+        }
+    }
+    FreePrpListPage(DevExt, page);
+    return changed;
 }
 
 //
@@ -683,6 +1005,21 @@ USHORT NvmeBuildCommandId(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK
 }
 
 //
+// NvmeFreeSrbPages - Give back the PRP list and metadata pages of a request
+//
+VOID NvmeFreeSrbPages(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_SRB_EXTENSION SrbExt)
+{
+    if (SrbExt->PrpListPage != 0xFF) {
+        FreePrpListPage(DevExt, SrbExt->PrpListPage);
+        SrbExt->PrpListPage = 0xFF;
+    }
+    if (SrbExt->MetaPage != 0xFF) {
+        FreePrpListPage(DevExt, SrbExt->MetaPage);
+        SrbExt->MetaPage = 0xFF;
+    }
+}
+
+//
 // NvmeBuildAdminCommandId - Command ID for an admin command carrying an SRB
 //
 USHORT NvmeBuildAdminCommandId(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN ULONG Kind)
@@ -873,9 +1210,9 @@ int NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_B
             {
                 PULONG rangeData = (PULONG)Srb->DataBuffer;
                 rangeData[0] = 0;  // Context attributes
-                rangeData[1] = numBlocks;  // Length in logical blocks
-                rangeData[2] = (ULONG)(lba & 0xFFFFFFFF);  // Starting LBA (low)
-                rangeData[3] = (ULONG)(lba >> 32);  // Starting LBA (high)
+                rangeData[1] = numBlocks << lun->LbaShift;  // Length in namespace blocks
+                rangeData[2] = (ULONG)((lba << lun->LbaShift) & 0xFFFFFFFF);  // Starting LBA (low)
+                rangeData[3] = (ULONG)((lba << lun->LbaShift) >> 32);  // Starting LBA (high)
 #ifdef NVMENT_DBG_EXTRA
                 ScsiDebugPrint(0, "NVMENT: DSM range data - CtxAttr=0x%08X Len=%u SLBA=0x%08X%08X\n",
                                rangeData[0], rangeData[1], rangeData[3], rangeData[2]);
@@ -906,12 +1243,39 @@ int NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_B
     }
 
     // Normal read/write: Set LBA and number of blocks
+    // In namespace blocks (4K=1: eight per SCSI block)
+    lba <<= lun->LbaShift;
+    numBlocks <<= lun->LbaShift;
     Cmd->CDW10 = (ULONG)(lba & 0xFFFFFFFF);
     Cmd->CDW11 = (ULONG)(lba >> 32);
     Cmd->CDW12 = ((numBlocks > 0) ? (numBlocks - 1) : 0) | (fua ? NVME_RW_FUA : 0);
     Cmd->CDW13 = 0;
     Cmd->CDW14 = 0;
     Cmd->CDW15 = 0;
+    if (lun->PiAct) {
+        Cmd->CDW12 |= NVME_RW_PRACT;
+    }
+    if (lun->MetaSize != 0) {
+        // Metadata the system has no use for: zeros on write, dropped on read
+        PNVME_SRB_EXTENSION ext = (PNVME_SRB_EXTENSION)Srb->SrbExtension;
+        UCHAR metaPage;
+        if (numBlocks * lun->MetaSize > NVME_PAGE_SIZE) {
+            DevExt->RejectedRequests++;
+            lun->NonTaggedInFlight = NULL;
+            ScsiError(DevExt, Srb, SRB_STATUS_INVALID_REQUEST);
+            return -1;
+        }
+        metaPage = AllocatePrpListPage(DevExt);
+        if (metaPage == 0xFF) {
+            lun->NonTaggedInFlight = NULL;
+            return 0;
+        }
+        if (isWrite) {
+            memset(GetPrpListPageVirtual(DevExt, metaPage), 0, numBlocks * lun->MetaSize);
+        }
+        ext->MetaPage = metaPage;
+        Cmd->MPTR = GetPrpListPagePhysical(DevExt, metaPage).QuadPart;
+    }
 
     // Normal read/write path - build PRPs
     // Get physical address of data buffer
@@ -1048,8 +1412,9 @@ VOID NvmePowerDown(IN PHW_DEVICE_EXTENSION DevExt)
         if (NvmeReadReg32(DevExt, NVME_REG_CSTS) == 0xFFFFFFFF) break;   // gone: nothing completes
         NvmeProcessIoCompletion(DevExt);
         NvmeProcessAdminCompletion(DevExt);
-        ScsiPortStallExecution(NVMENT_POLL_INTERVAL_USEC);
+        ScsiPortStallExecution(10);
     }
+    NvmeFullPower(DevExt);
     NvmeShutdownController(DevExt);
 }
 
@@ -1536,8 +1901,8 @@ BOOLEAN NvmeStartController(IN PHW_DEVICE_EXTENSION DevExt)
         }
     }
 
-    // APST=1: autonomous power state transitions with the table built
-    // from the power state descriptors
+    // Autonomous power state transitions with the table built from the
+    // power state descriptors (off with APST=0)
     DevExt->ApstOn = FALSE;
     if (DevExt->ApstAllowed && DevExt->ApstSupported && !DevExt->DumpMode) {
         memset(DevExt->UtilityBuffer, 0, NVME_PAGE_SIZE);
@@ -1553,11 +1918,19 @@ BOOLEAN NvmeStartController(IN PHW_DEVICE_EXTENSION DevExt)
 #endif
     }
 
+    // Host memory buffer given before (a reset or power loss took it back)
+    DevExt->HmbOn = FALSE;
+    if (DevExt->HmbEntries != 0 && !DevExt->DumpMode) NvmeEnableHmb(DevExt);
+
     // Identify data is in the utility buffer, which is the PRP pool from now on
     memset(DevExt->UtilityBuffer, 0, NVME_PAGE_SIZE);
     DevExt->PrpListPageBitmap = 0;
     DevExt->Stopped = FALSE;
     DevExt->InitComplete = TRUE;
+
+    // Asynchronous events: health warnings, namespace changes, firmware
+    // activation; the controller tells instead of being asked
+    NvmeStartAer(DevExt);
 
 #ifdef NVMENT_DBG
     ScsiDebugPrint(0, "NVMENT: Init complete - %u LUN(s), VWC %s\n",
@@ -1655,6 +2028,7 @@ BOOLEAN NvmeReinitialize(IN PHW_DEVICE_EXTENSION DevExt)
     if (!DevExt->PollMode) {
         NvmeEnableInterrupts(DevExt);
     }
+    NvmeArmHotPlug(DevExt);
     ScsiPortNotification(NextRequest, DevExt, NULL);
     return TRUE;
 }
@@ -1705,6 +2079,185 @@ BOOLEAN NvmeSetPowerState(IN PHW_DEVICE_EXTENSION DevExt, IN UCHAR PowerState)
     }
     DevExt->PowerState = PowerState;
     return TRUE;
+}
+
+//
+// NvmeFullPower - before a shutdown notification or a power transition:
+// autonomous transitions off and power state 0, so the controller takes the
+// shutdown at full power, as it did before APST was the default
+//
+VOID NvmeFullPower(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    NVME_COMMAND cmd;
+
+    if (!DevExt->InitComplete || NvmeReadReg32(DevExt, NVME_REG_CSTS) == 0xFFFFFFFF) return;
+    if (DevExt->ApstOn) {
+        memset(DevExt->UtilityBuffer, 0, NVME_PAGE_SIZE);
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.CDW0.Fields.Opcode = NVME_ADMIN_SET_FEATURES;
+        cmd.PRP1 = DevExt->UtilityBufferPhys.QuadPart;
+        cmd.CDW10 = NVME_FEAT_APST;
+        cmd.CDW11 = 0;
+        if (NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS)) DevExt->ApstOn = FALSE;
+    }
+    if (DevExt->Npss != 0 && DevExt->PowerState != 0) NvmeSetPowerState(DevExt, 0);
+}
+
+#ifndef NVMENT_W9X
+//
+// Host memory buffer: memory of the host the controller uses for its own
+// tables (DRAM-less SSDs). Taken once, at HwFindAdapter (passive level),
+// from the system's contiguous memory, and kept: after a reset or a power
+// transition the same buffer is given again (as new: no "memory return").
+// Not on 9x and not in the dump stack.
+//
+#ifdef _WIN64
+typedef ULONGLONG NVME_SIZE;
+#else
+typedef ULONG NVME_SIZE;
+#endif
+PVOID __stdcall MmAllocateContiguousMemory(NVME_SIZE NumberOfBytes, ULONGLONG HighestAcceptableAddress);
+VOID __stdcall MmFreeContiguousMemory(PVOID BaseAddress);
+ULONGLONG __stdcall MmGetPhysicalAddress(PVOID BaseAddress);
+#if (_WIN32_WINNT >= 0x500)
+LONG __stdcall ZwQuerySystemInformation(ULONG InfoClass, PVOID Info, ULONG Length, PULONG ReturnLength);
+#else
+ULONG __stdcall MmQuerySystemSize(VOID);
+#endif
+
+// Upper limit in 4 KB pages: HMB=n MB, else NVMENT_HMB_MAX_MB, and at most
+// 1/16 of the RAM (NT 3.1-4.0, which cannot tell the size: 16 MB on a
+// large system, none on a small or medium one)
+static ULONG NvmeHmbLimit(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    ULONG limit = (DevExt->HmbCapMb != 0 ? DevExt->HmbCapMb : NVMENT_HMB_MAX_MB) * 256;
+#if (_WIN32_WINNT >= 0x500)
+    ULONG info[16], len = 0, ram;
+
+    memset(info, 0, sizeof(info));
+    // SystemBasicInformation; its exact size is required (44 bytes, 64 on x64)
+    if (ZwQuerySystemInformation(0, info, sizeof(NVME_SIZE) == 8 ? 64 : 44, &len) >= 0 && info[2] == 0x1000) {
+        ram = info[3];                              // NumberOfPhysicalPages
+        if (limit > ram / 16) limit = ram / 16;
+    }
+#else
+    if (MmQuerySystemSize() < 2) {
+        limit = 0;
+    } else if (DevExt->HmbCapMb == 0 && limit > 16 * 256) {
+        limit = 16 * 256;
+    }
+#endif
+    return limit;
+}
+
+static VOID NvmeFreeHmb(IN PHW_DEVICE_EXTENSION DevExt, IN PVOID *Virt, IN ULONG Count)
+{
+    ULONG i;
+
+    for (i = 0; i < Count; i++) MmFreeContiguousMemory(Virt[i]);
+    DevExt->HmbEntries = 0;
+    DevExt->HmbPages = 0;
+}
+
+VOID NvmeSetupHmb(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    static PVOID virt[NVMENT_HMB_MAX_ENTRIES];
+    ULONG want, limit, maxEntries, minChunk, chunk, n = 0, total = 0;
+    PULONG list;
+    PVOID p;
+    ULONGLONG phys;
+
+    if (!DevExt->HmbAllowed || DevExt->DumpMode || DevExt->HmbEntries != 0 || DevExt->Hmpre == 0) return;
+    limit = NvmeHmbLimit(DevExt);
+    want = DevExt->Hmpre;
+    if (want > limit) want = limit;
+    if (want == 0 || want < DevExt->Hmmin) {
+#ifdef NVMENT_DBG
+        ScsiDebugPrint(0, "NVMENT: HMB: %u KB preferred, %u KB minimum, limit %u KB: not given\n",
+                       DevExt->Hmpre * 4, DevExt->Hmmin * 4, limit * 4);
+#endif
+        return;
+    }
+    maxEntries = NVMENT_HMB_MAX_ENTRIES;
+    if (DevExt->Hmmaxd != 0 && DevExt->Hmmaxd < maxEntries) maxEntries = DevExt->Hmmaxd;
+    minChunk = DevExt->Hmminds != 0 ? DevExt->Hmminds : 1;      // 4 KB units
+
+    list = (PULONG)MmAllocateContiguousMemory(NVME_PAGE_SIZE, ~(ULONGLONG)0);
+    if (list == NULL) return;
+    memset(list, 0, NVME_PAGE_SIZE);
+
+    chunk = NVMENT_HMB_CHUNK / NVME_PAGE_SIZE;
+    while (total < want && n < maxEntries) {
+        ULONG size = want - total;
+        if (size > chunk) size = chunk;
+        if (size < minChunk) size = minChunk;
+        p = MmAllocateContiguousMemory((NVME_SIZE)size * NVME_PAGE_SIZE, ~(ULONGLONG)0);
+        if (p == NULL) {
+            if (chunk / 2 < minChunk || chunk <= 16) break;      // nothing below 64 KB pieces
+            chunk /= 2;
+            continue;
+        }
+        phys = MmGetPhysicalAddress(p);
+        if (phys & (NVME_PAGE_SIZE - 1)) {                          // never: page-aligned
+            MmFreeContiguousMemory(p);
+            break;
+        }
+        virt[n] = p;
+        list[n * 4] = (ULONG)phys;
+        list[n * 4 + 1] = (ULONG)(phys >> 32);
+        list[n * 4 + 2] = size;
+        n++;
+        total += size;
+    }
+    DevExt->HmbEntries = (USHORT)n;
+    DevExt->HmbPages = total;
+    if (total < DevExt->Hmmin || n == 0) {
+        NvmeFreeHmb(DevExt, virt, n);
+        MmFreeContiguousMemory(list);
+#ifdef NVMENT_DBG
+        ScsiDebugPrint(0, "NVMENT: HMB: only %u KB of %u KB taken, not given\n", total * 4, want * 4);
+#endif
+        return;
+    }
+    DevExt->HmbList = list;
+    DevExt->HmbListPhys = MmGetPhysicalAddress(list);
+    if (!NvmeEnableHmb(DevExt)) {
+        // Refused: the memory goes back to the system
+        NvmeFreeHmb(DevExt, virt, n);
+        MmFreeContiguousMemory(list);
+        DevExt->HmbList = NULL;
+    }
+#ifdef NVMENT_DBG
+    ScsiDebugPrint(0, "NVMENT: HMB: %u KB in %u piece(s) (preferred %u KB, minimum %u KB): %s\n",
+                   total * 4, n, DevExt->Hmpre * 4, DevExt->Hmmin * 4, DevExt->HmbOn ? "on" : "refused");
+#endif
+}
+#else
+VOID NvmeSetupHmb(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    (VOID)DevExt;
+}
+#endif
+
+//
+// NvmeEnableHmb - Set Features Host Memory Buffer with the buffer taken
+//
+BOOLEAN NvmeEnableHmb(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    NVME_COMMAND cmd;
+
+    DevExt->HmbOn = FALSE;
+    if (DevExt->HmbEntries == 0) return FALSE;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.CDW0.Fields.Opcode = NVME_ADMIN_SET_FEATURES;
+    cmd.CDW10 = NVME_FEAT_HMB;
+    cmd.CDW11 = 1;                                  // EHM, memory not returned
+    cmd.CDW12 = DevExt->HmbPages;                   // HSIZE in memory pages (4 KB)
+    cmd.CDW13 = (ULONG)DevExt->HmbListPhys;
+    cmd.CDW14 = (ULONG)(DevExt->HmbListPhys >> 32);
+    cmd.CDW15 = DevExt->HmbEntries;
+    DevExt->HmbOn = NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS);
+    return DevExt->HmbOn;
 }
 
 //

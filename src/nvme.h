@@ -61,6 +61,16 @@
 #define NVME_ADMIN_ABORT        0x08
 #define NVME_ADMIN_SET_FEATURES 0x09
 #define NVME_ADMIN_GET_FEATURES 0x0A
+#define NVME_ADMIN_ASYNC_EVENT  0x0C
+#define NVME_ADMIN_NS_MGMT      0x0D
+#define NVME_ADMIN_FW_COMMIT    0x10
+#define NVME_ADMIN_FW_DOWNLOAD  0x11
+#define NVME_ADMIN_SELF_TEST    0x14
+#define NVME_ADMIN_NS_ATTACH    0x15
+#define NVME_ADMIN_FORMAT_NVM   0x80
+#define NVME_ADMIN_SECURITY_SEND 0x81
+#define NVME_ADMIN_SECURITY_RECV 0x82
+#define NVME_ADMIN_SANITIZE     0x84
 
 //
 // NVMe I/O Command Opcodes
@@ -86,6 +96,19 @@
 #define NVME_FEAT_POWER_MGMT    0x02
 #define NVME_FEAT_VOLATILE_WC   0x06
 #define NVME_FEAT_APST          0x0C    // autonomous power state transition
+#define NVME_FEAT_NUM_QUEUES    0x07
+#define NVME_FEAT_ASYNC_EVENT   0x0B    // Asynchronous Event Configuration
+#define NVME_FEAT_HMB           0x0D
+
+// Asynchronous events (completion DW0)
+#define NVME_AER_TYPE(dw0)      ((dw0) & 0x7)
+#define NVME_AER_INFO(dw0)      (((dw0) >> 8) & 0xFF)
+#define NVME_AER_LOG(dw0)       (((dw0) >> 16) & 0xFF)
+#define NVME_AER_TYPE_SMART     1
+#define NVME_AER_TYPE_NOTICE    2
+#define NVME_AER_NOTICE_NS_CHANGED 0x00
+#define NVME_OAES_NS_ATTR       0x00000100  // OAES bit 8: Namespace Attribute Notices
+#define NVME_OAES_FW_ACTIVATE   0x00000200  // OAES bit 9: Firmware Activation Notices
 
 //
 // Optional NVM Command Support (Identify Controller ONCS)
@@ -100,6 +123,7 @@
 // I/O command bits
 //
 #define NVME_RW_FUA             0x40000000  // CDW12 bit 30: Force Unit Access
+#define NVME_RW_PRACT           0x20000000  // CDW12 bit 29: protection information action
 #define NVME_DSM_DEALLOCATE     0x00000004  // CDW11 bit 2: Attribute - Deallocate
 
 //

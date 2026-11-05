@@ -720,6 +720,7 @@ BOOLEAN ScsiHandleReadWrite(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLO
     rc = NvmeBuildReadWriteCommand(DevExt, Srb, &nvmeCmd, commandId);
     if (rc <=0) {
         // most likely couldnt get memory for PRP list
+        NvmeFreeSrbPages(DevExt, srbExt);
         
         if (rc == 0) {
             lun->NonTaggedInFlight = NULL;
@@ -739,10 +740,7 @@ BOOLEAN ScsiHandleReadWrite(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLO
             || DevExt->CurrentQueueDepth >= NVME_MAX_QUEUE_SIZE);
     } else {
         // Submission failed, likely a full queue. Free resources and mark as busy.
-        if (srbExt->PrpListPage != 0xFF) {
-            FreePrpListPage(DevExt, srbExt->PrpListPage);
-            srbExt->PrpListPage = 0xFF;
-        }
+        NvmeFreeSrbPages(DevExt, srbExt);
         lun->NonTaggedInFlight = NULL;
         return ScsiBusy(DevExt, Srb);
     }
@@ -978,15 +976,15 @@ BOOLEAN ScsiHandleVerify(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK 
         return ScsiSuccess(DevExt, Srb);
     }
 
-    // One Verify covers at most 65536 blocks; longer requests are verified in front
-    if (count > 0x10000) {
-        count = 0x10000;
+    // One Verify covers at most 65536 namespace blocks; longer requests are verified in front
+    if (count > (0x10000UL >> lun->LbaShift)) {
+        count = 0x10000UL >> lun->LbaShift;
     }
     memset(&cmd, 0, sizeof(cmd));
     cmd.CDW0.Fields.Opcode = NVME_CMD_VERIFY;
-    cmd.CDW10 = (ULONG)(lba & 0xFFFFFFFF);
-    cmd.CDW11 = (ULONG)(lba >> 32);
-    cmd.CDW12 = count - 1;
+    cmd.CDW10 = (ULONG)((lba << lun->LbaShift) & 0xFFFFFFFF);
+    cmd.CDW11 = (ULONG)((lba << lun->LbaShift) >> 32);
+    cmd.CDW12 = (count << lun->LbaShift) - 1;
     return ScsiSubmitNoData(DevExt, Srb, &cmd);
 }
 
@@ -1060,10 +1058,22 @@ BOOLEAN ScsiHandleUnmap(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK S
             ScsiSetSense(DevExt, Srb, SCSI_SENSE_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE, 0);
             return ScsiError(DevExt, Srb, Srb->SrbStatus);
         }
-        ranges[count * 4 + 1] = blocks;
-        ranges[count * 4 + 2] = (ULONG)(lba & 0xFFFFFFFF);
-        ranges[count * 4 + 3] = (ULONG)(lba >> 32);
-        count++;
+        // In namespace blocks (4K=1: eight per SCSI block), a range at most 2^32-1 long
+        lba <<= lun->LbaShift;
+        while (blocks != 0) {
+            ULONG piece = (blocks > (0xFFFFFFFFUL >> lun->LbaShift)) ? (0xFFFFFFFFUL >> lun->LbaShift) : blocks;
+            if (count >= NVME_PAGE_SIZE / 16) {
+                FreePrpListPage(DevExt, page);
+                ScsiSetSense(DevExt, Srb, SCSI_SENSE_ILLEGAL_REQUEST, ASC_INVALID_FIELD_IN_CDB, 0);
+                return ScsiError(DevExt, Srb, Srb->SrbStatus);
+            }
+            ranges[count * 4 + 1] = piece << lun->LbaShift;
+            ranges[count * 4 + 2] = (ULONG)(lba & 0xFFFFFFFF);
+            ranges[count * 4 + 3] = (ULONG)(lba >> 32);
+            count++;
+            lba += (ULONGLONG)piece << lun->LbaShift;
+            blocks -= piece;
+        }
     }
     if (count == 0) {
         FreePrpListPage(DevExt, page);
@@ -1173,11 +1183,14 @@ BOOLEAN ScsiHandleReportLuns(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BL
     ULONG first = (ULONG)Srb->TargetId * NVMENT_LUNS_PER_TARGET;
     ULONG luns = (DevExt->LunCount > first) ? DevExt->LunCount - first : 0;
     ULONG length;
-    ULONG i;
+    ULONG i, n;
 
-    // The namespaces of this target
+    // The namespaces of this target (without those gone at run time)
     if (luns > NVMENT_LUNS_PER_TARGET) luns = NVMENT_LUNS_PER_TARGET;
-    length = 8 + luns * 8;
+    for (i = 0, n = 0; i < luns; i++) {
+        if (DevExt->Luns[first + i].NamespaceId != 0) n++;
+    }
+    length = 8 + n * 8;
 
     if (allocation > Srb->DataTransferLength) {
         allocation = Srb->DataTransferLength;
@@ -1187,12 +1200,14 @@ BOOLEAN ScsiHandleReportLuns(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BL
         return ScsiError(DevExt, Srb, Srb->SrbStatus);
     }
     memset(data, 0, allocation);
-    data[0] = (UCHAR)((luns * 8) >> 24);
-    data[1] = (UCHAR)((luns * 8) >> 16);
-    data[2] = (UCHAR)((luns * 8) >> 8);
-    data[3] = (UCHAR)(luns * 8);
-    for (i = 0; i < luns && 8 + i * 8 + 8 <= allocation; i++) {
-        data[8 + i * 8 + 1] = (UCHAR)i;   // single level, peripheral device addressing
+    data[0] = (UCHAR)((n * 8) >> 24);
+    data[1] = (UCHAR)((n * 8) >> 16);
+    data[2] = (UCHAR)((n * 8) >> 8);
+    data[3] = (UCHAR)(n * 8);
+    for (i = 0, n = 0; i < luns && 8 + n * 8 + 8 <= allocation; i++) {
+        if (DevExt->Luns[first + i].NamespaceId == 0) continue;
+        data[8 + n * 8 + 1] = (UCHAR)i;   // single level, peripheral device addressing
+        n++;
     }
     Srb->DataTransferLength = (length < allocation) ? length : allocation;
     return ScsiSuccess(DevExt, Srb);
@@ -1792,7 +1807,8 @@ BOOLEAN HandleIO_NVMENT(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK S
                               (DevExt->Stopped ? NVMENT_INFO_POWERED_DOWN : 0) |
                               (DevExt->VwcEnabled ? NVMENT_INFO_VWC : 0) |
                               (DevExt->TrimEnable ? NVMENT_INFO_TRIM_MODE : 0) |
-                              (DevExt->ApstOn ? NVMENT_INFO_APST : 0);
+                              (DevExt->ApstOn ? NVMENT_INFO_APST : 0) |
+                              (DevExt->HmbOn ? NVMENT_INFO_HMB : 0);
                 info->LunCount = DevExt->LunCount;
                 info->PowerState = DevExt->PowerState;
                 info->MaxTransfer = DevExt->MaxTransferSizeBytes;
@@ -1859,6 +1875,20 @@ BOOLEAN HandleIO_NVMENT(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK S
 #endif
             Srb->SrbStatus = SRB_STATUS_SUCCESS;
             srbControl->ReturnCode = 0;  // Success
+            return TRUE;
+
+        case NVMENT_IOCTL_GET_LOCATION:
+            if (srbControl->Length >= sizeof(ULONG) &&
+                Srb->DataTransferLength >= sizeof(SRB_IO_CONTROL) + sizeof(ULONG)) {
+                PCI_SLOT_NUMBER slot;
+                slot.u.AsULONG = DevExt->SlotNumber;
+                *(PULONG)((PUCHAR)Srb->DataBuffer + sizeof(SRB_IO_CONTROL)) =
+                    (DevExt->BusNumber << 16) | (slot.u.bits.DeviceNumber << 8) | slot.u.bits.FunctionNumber;
+                srbControl->ReturnCode = 0;
+            } else {
+                srbControl->ReturnCode = 1;
+            }
+            Srb->SrbStatus = SRB_STATUS_SUCCESS;
             return TRUE;
 
         case NVMENT_IOCTL_TRIM_MODE_OFF:
@@ -2045,12 +2075,115 @@ BOOLEAN HandleIO_NvmeMini(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK
             }
 
         default:
-#ifdef NVMENT_DBG
-            ScsiDebugPrint(0, "NVMENT: NvmeMini unsupported NVMe admin opcode: %02X\n", nvmeOpcode);
-#endif
-            srbControl->ReturnCode = 1;  // Error
-            return FALSE;
+            return NvmeUserAdmin(DevExt, Srb, nvmePassThru);
     }
+}
+
+//
+// NvmeUserAdmin - Any other admin command through NvmeMini, with up to one
+// page of data either way. Always: Get Features, Device Self-test, Set
+// Features for temperature thresholds, error recovery, volatile write
+// cache, timestamp and thermal management. With ADMIN=1 also: Set
+// Features otherwise, Format NVM, Sanitize, Namespace Management and
+// Attachment, Firmware Download and Commit, Security Send/Receive. Never:
+// queue management, Abort, Asynchronous Event Request, and the features the
+// driver owns (number of queues, event configuration, host memory buffer).
+//
+BOOLEAN NvmeUserAdmin(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN PNVME_PASS_THROUGH Pt)
+{
+    PSRB_IO_CONTROL srbControl = (PSRB_IO_CONTROL)Srb->DataBuffer;
+    PNVME_SRB_EXTENSION srbExt = (PNVME_SRB_EXTENSION)Srb->SrbExtension;
+    PULONG c = Pt->Command;
+    UCHAR opc = (UCHAR)(c[0] & 0xFF);
+    ULONG fid = c[10] & 0xFF;
+    ULONG dataOffset = sizeof(SRB_IO_CONTROL) + sizeof(NVME_PASS_THROUGH);
+    ULONG len = (Pt->Direction & 3) ? Pt->DataBufferLen : 0;
+    BOOLEAN allowed = FALSE;
+    NVME_COMMAND cmd;
+    UCHAR page = 0xFF;
+    USHORT commandId;
+    ULONG i;
+
+    switch (opc) {
+        case NVME_ADMIN_GET_FEATURES:
+        case NVME_ADMIN_SELF_TEST:
+            allowed = TRUE;
+            break;
+        case NVME_ADMIN_SET_FEATURES:
+            if (fid == NVME_FEAT_NUM_QUEUES || fid == NVME_FEAT_ASYNC_EVENT || fid == NVME_FEAT_HMB) {
+                break;
+            }
+            allowed = (BOOLEAN)(fid == 0x04 || fid == 0x05 || fid == NVME_FEAT_VOLATILE_WC || fid == 0x0E ||
+                                fid == 0x10 || DevExt->AdminAll);
+            break;
+        case NVME_ADMIN_FORMAT_NVM:
+        case NVME_ADMIN_SANITIZE:
+        case NVME_ADMIN_NS_MGMT:
+        case NVME_ADMIN_NS_ATTACH:
+        case NVME_ADMIN_FW_DOWNLOAD:
+        case NVME_ADMIN_FW_COMMIT:
+        case NVME_ADMIN_SECURITY_SEND:
+        case NVME_ADMIN_SECURITY_RECV:
+            allowed = DevExt->AdminAll;
+            break;
+    }
+    if (!allowed || len > NVME_PAGE_SIZE || Srb->DataTransferLength < dataOffset + len || srbExt == NULL) {
+#ifdef NVMENT_DBG
+        ScsiDebugPrint(0, "NVMENT: NvmeMini admin opcode %02X refused (FID %02X, %u bytes)\n", opc, fid, len);
+#endif
+        srbControl->ReturnCode = 1;
+        return FALSE;
+    }
+
+    memset(&cmd, 0, sizeof(cmd));
+    if (len != 0) {
+        page = AllocatePrpListPage(DevExt);
+        if (page == 0xFF) {
+            srbControl->ReturnCode = 1;
+            return FALSE;
+        }
+        memset(GetPrpListPageVirtual(DevExt, page), 0, NVME_PAGE_SIZE);
+        if (Pt->Direction & 1) {
+            memcpy(GetPrpListPageVirtual(DevExt, page), (PUCHAR)Srb->DataBuffer + dataOffset, len);
+        }
+        cmd.PRP1 = GetPrpListPagePhysical(DevExt, page).QuadPart;
+    }
+    srbExt->PrpListPage = page;
+
+    commandId = NvmeBuildAdminCommandId(DevExt, Srb, ADMIN_KIND_USER);
+    cmd.CDW0.Fields.Opcode = opc;
+    cmd.CDW0.Fields.CommandId = commandId;
+    cmd.NSID = c[1];
+    cmd.CDW10 = c[10];
+    cmd.CDW11 = c[11];
+    cmd.CDW12 = c[12];
+    cmd.CDW13 = c[13];
+    cmd.CDW14 = c[14];
+    cmd.CDW15 = c[15];
+    for (i = 0; i < 4; i++) {
+        Pt->Completion[i] = 0;
+    }
+#ifdef NVMENT_DBG
+    ScsiDebugPrint(0, "NVMENT: NvmeMini admin opcode %02X NSID %08X CDW10 %08X, %u bytes dir %u\n",
+                   opc, c[1], c[10], len, Pt->Direction);
+#endif
+    if (commandId & CID_NON_TAGGED_FLAG) {
+        DevExt->Luns[CID_LUN(commandId)].NonTaggedInFlight = Srb;
+    }
+    if (!NvmeSubmitAdminCommand(DevExt, &cmd)) {
+        if (commandId & CID_NON_TAGGED_FLAG) {
+            DevExt->Luns[CID_LUN(commandId)].NonTaggedInFlight = NULL;
+        }
+        if (page != 0xFF) {
+            FreePrpListPage(DevExt, page);
+        }
+        srbExt->PrpListPage = 0xFF;
+        srbControl->ReturnCode = 1;
+        return FALSE;
+    }
+    Srb->SrbStatus = SRB_STATUS_PENDING;
+    srbControl->ReturnCode = 0;
+    return TRUE;
 }
 
 //

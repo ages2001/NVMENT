@@ -148,6 +148,66 @@ VOID NvmeProcessGetLogPageCompletion(IN PHW_DEVICE_EXTENSION DevExt, IN USHORT s
 }
 
 //
+// NvmeUserGeneric - An NvmeMini command that went through NvmeUserAdmin
+// (anything but Identify and Get Log Page, which keep their own layout)
+//
+static BOOLEAN NvmeUserGeneric(IN PNVME_PASS_THROUGH Pt)
+{
+    UCHAR opc = (UCHAR)(Pt->Command[0] & 0xFF);
+    return (BOOLEAN)(opc != NVME_ADMIN_IDENTIFY && opc != NVME_ADMIN_GET_LOG_PAGE);
+}
+
+//
+// NvmeUserGenericDone - Completion of such a command: the completion entry
+// in the pass-through structure (the caller sees the NVMe status there as
+// well), the data for device-to-host commands, and what the driver has to
+// follow: namespaces after attachment, management, format and sanitize,
+// the write cache setting after Set Features
+//
+static VOID NvmeUserGenericDone(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN USHORT status,
+                                IN PNVME_COMPLETION cqEntry, IN PVOID prpBuffer)
+{
+    PSRB_IO_CONTROL srbControl = (PSRB_IO_CONTROL)Srb->DataBuffer;
+    PNVME_PASS_THROUGH pt = (PNVME_PASS_THROUGH)((PUCHAR)Srb->DataBuffer + sizeof(SRB_IO_CONTROL));
+    ULONG dataOffset = sizeof(SRB_IO_CONTROL) + sizeof(NVME_PASS_THROUGH);
+    UCHAR opc = (UCHAR)(pt->Command[0] & 0xFF);
+
+    pt->Completion[0] = cqEntry->DW0;
+    pt->Completion[1] = cqEntry->DW1;
+    pt->Completion[2] = ((ULONG)cqEntry->SQID << 16) | cqEntry->SQHead;
+    pt->Completion[3] = ((ULONG)cqEntry->Status << 16) | cqEntry->CID;
+    if (status != NVME_SC_SUCCESS) {
+        // The request itself succeeds, so that the caller gets the
+        // completion entry back with the NVMe status in it
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        srbControl->ReturnCode = 1;
+        return;
+    }
+    if ((pt->Direction & 2) && prpBuffer != NULL && pt->DataBufferLen <= NVME_PAGE_SIZE &&
+        Srb->DataTransferLength >= dataOffset + pt->DataBufferLen) {
+        memcpy((PUCHAR)Srb->DataBuffer + dataOffset, prpBuffer, pt->DataBufferLen);
+    }
+    switch (opc) {
+        case NVME_ADMIN_NS_MGMT:
+        case NVME_ADMIN_NS_ATTACH:
+            DevExt->NsChangePending = TRUE;
+            break;
+        case NVME_ADMIN_FORMAT_NVM:
+        case NVME_ADMIN_SANITIZE:
+            DevExt->NsChangePending = TRUE;
+            DevExt->NsRefresh = TRUE;
+            break;
+        case NVME_ADMIN_SET_FEATURES:
+            if ((pt->Command[10] & 0xFF) == NVME_FEAT_VOLATILE_WC) {
+                DevExt->VwcEnabled = (BOOLEAN)((pt->Command[11] & 1) != 0);
+            }
+            break;
+    }
+    Srb->SrbStatus = SRB_STATUS_SUCCESS;
+    srbControl->ReturnCode = 0;
+}
+
+//
 // NvmeProcessUserExtensionCompletion - Handle userspace called NVMe extension completion
 //
 VOID NvmeProcessUserExtensionCompletion(
@@ -207,6 +267,9 @@ VOID NvmeProcessUserExtensionCompletion(
                 Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
             }
 
+        } else if (Srb->Function == SRB_FUNCTION_IO_CONTROL &&
+                   NvmeUserGeneric((PNVME_PASS_THROUGH)((PUCHAR)Srb->DataBuffer + sizeof(SRB_IO_CONTROL)))) {
+            NvmeUserGenericDone(DevExt, Srb, status, cqEntry, prpBuffer);
         } else if (Srb->Function == SRB_FUNCTION_IO_CONTROL) {
             PSRB_IO_CONTROL srbControl = (PSRB_IO_CONTROL)Srb->DataBuffer;
             // IO_CONTROL path (NvmeMini) - complex buffer layout
@@ -251,6 +314,9 @@ VOID NvmeProcessUserExtensionCompletion(
             }
 
         }
+    } else if (Srb->Function == SRB_FUNCTION_IO_CONTROL &&
+               NvmeUserGeneric((PNVME_PASS_THROUGH)((PUCHAR)Srb->DataBuffer + sizeof(SRB_IO_CONTROL)))) {
+        NvmeUserGenericDone(DevExt, Srb, status, cqEntry, prpBuffer);
     } else {
         // On error, don't modify the buffer
         Srb->SrbStatus = SRB_STATUS_ERROR;
@@ -331,6 +397,23 @@ BOOLEAN NvmeProcessAdminCompletion(IN PHW_DEVICE_EXTENSION DevExt)
                                commandId == ADMIN_CID_SHUTDOWN_DELETE_SQ ? "SQ" : "CQ", status);
             }
 #endif
+            continue;
+        }
+
+        if (commandId == ADMIN_CID_AER) {
+            // An event (read and cleared by the timer), or the request ended
+            // with the controller (reset, shutdown: asked again at the next
+            // setup; refused: no further requests)
+            DevExt->AerOutstanding = FALSE;
+            if (status == NVME_SC_SUCCESS) {
+                DevExt->AerType = (UCHAR)NVME_AER_TYPE(cqEntry->DW0);
+                DevExt->AerInfo = (UCHAR)NVME_AER_INFO(cqEntry->DW0);
+                DevExt->AerLog = (UCHAR)NVME_AER_LOG(cqEntry->DW0);
+                DevExt->AerLogPending = TRUE;
+                DevExt->AerEvents++;
+            } else if (status != NVME_SC_ABORT_QUEUE && status != NVME_SC_ABORT_REQ) {
+                DevExt->AerOn = FALSE;
+            }
             continue;
         }
 
@@ -482,11 +565,8 @@ BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
             // Get SRB extension for PRP list cleanup
             srbExt = (PNVME_SRB_EXTENSION)Srb->SrbExtension;
 
-            // Free PRP list page if allocated
-            if (srbExt->PrpListPage != 0xFF) {
-                FreePrpListPage(DevExt, srbExt->PrpListPage);
-                srbExt->PrpListPage = 0xFF;
-            }
+            // Free the PRP list and metadata pages if allocated
+            NvmeFreeSrbPages(DevExt, srbExt);
 
             // Check if this was a TRIM operation that we need to restore buffer for
             if (DevExt->TrimEnable && DevExt->TrimPattern != NULL && Srb->DataTransferLength >= 4096) {

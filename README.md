@@ -6,11 +6,11 @@
 
 | | |
 |---|---|
-| **Version** | 3.1.0.0 |
+| **Version** | 3.2.0.0 |
 | **Operating systems** | Windows 95 / 98 / Me · Windows NT 3.1 / 3.50 / 3.51 / 4.0 · Windows 2000 / XP / Server 2003 (x86, Alpha) · Windows XP x64 / Server 2003 x64 |
 | **Hardware** | NVMe controllers (PCI class code `01-08-02`), NVMe 1.0 and later, up to 32 per system |
 | **Devices** | Up to 32 namespaces per controller, each a disk (512, 1024, 2048 and 4096-byte LBA formats) |
-| **Binaries** | `nvment9x.mpd` (Windows 9x/Me) · `nvment.sys` (NT 3.1–4.0) · `nvment.sys` (2000/XP/2003, x86 and x64) |
+| **Binaries** | `nvment9x.mpd` (Windows 9x/Me) · `nvment.sys` (NT 3.1–4.0) · `nvment.sys` (2000/XP/2003, x86 and x64) · `nvmecfg.exe` (port program, NT 3.1–4.0 and 9x/Me) |
 | **License** | 3-Clause BSD — see [License](#license) |
 
 ## Highlights
@@ -57,7 +57,8 @@ It seemed like a good idea at first.
   - `OFF=` leaves single namespaces out (by NSID), optionally on one controller only
   - Volatile write cache control (Set/Get Features 06h), FUA, flush
   - Dataset Management (deallocate) for UNMAP and TRIM mode, NVMe Verify for VERIFY
-  - Power states: power state 0 while running; START STOP UNIT and the POWER_DOWN IOCTL move the controller to its deepest non-operational state or shut it down; autonomous power state transitions (APST) with `APST=1`
+  - Power states: power state 0 while running; START STOP UNIT and the POWER_DOWN IOCTL move the controller to its deepest non-operational state or shut it down; autonomous power state transitions (APST) on by default where the controller has them (`APST=0` off), turned off and power state 0 before a shutdown notification
+  - **Host Memory Buffer** for DRAM-less SSDs (NT 3.1 to XP x64): the size the controller prefers, up to 64 MB and 1/16 of the RAM, taken from the system's contiguous memory at start and given again after every reset (`HMB=0` off, `HMB=n` at most n MB); see [Host Memory Buffer](#host-memory-buffer)
   - Controller reset and recovery: a hung controller (CSTS.CFS, command time-outs) is reset and set up again, and outstanding requests are returned for ScsiPort to retry
   - A controller without namespaces (or whose namespaces are all unusable) presents no LUN; a namespace with no capacity answers NOT READY
 
@@ -113,6 +114,7 @@ It seemed like a good idea at first.
 | `src\nvmecpl.c` | Completion queue processing |
 | `src\nvmesatl.c` | SCSI translation, sense data, MODE/LOG SENSE, UNMAP, VERIFY, SMART and the IOCTLs |
 | `src\nvmeutil.c`, `src\nvmeutil.h` | Helpers: PCI access, argument parsing, SMART/log page translation, signatures |
+| `src\nvmepdo.c` | 2000/XP/x64 only: `IRP_MJ_DEVICE_CONTROL` front end that passes the SMART requests of `disk.sys` on to the miniport (see [Windows 2000/XP/x64 specifics](#windows-2000xpx64-specifics)) |
 | `src\nvment.h`, `src\nvme.h`, `src\scsiext.h` | Driver structures and limits, NVMe definitions, SCSI additions |
 | `src\nvment.rc` | Version resource (`nvment.sys` / `nvment9x.mpd`) |
 | `src\2KXP`, `src\NT`, `src\9X` | Build files per target |
@@ -127,7 +129,7 @@ It seemed like a good idea at first.
 | Build folder (sources are shared in `src\`) | `src\9X` | `src\NT` | `src\2KXP` |
 | Target define | `NVMENT_W9X`, `_WIN32_WINNT=0x400` | `_WIN32_WINNT=0x400` (NT 3.1 support built in) | `_WIN32_WINNT=0x500` |
 | Driver binary | `nvment9x.mpd` | `nvment.sys` | `nvment.sys` |
-| I/O model | Fast Polling; interrupt with `IRQ=1` | Interrupt on NT 3.50–4.0; NT 3.1 Fast Polling unless `IRQ=1`; Fast Polling with `IRQ=0` | Interrupt on the PnP-assigned line; Fast Polling in the dump stack and with `IRQ=0` |
+| I/O model | Interrupt on the device node's line; Fast Polling with `IRQ=0` | Interrupt on NT 3.50–4.0; NT 3.1 Fast Polling unless `IRQ=1`; Fast Polling with `IRQ=0` | Interrupt on the PnP-assigned line; Fast Polling in the dump stack and with `IRQ=0` |
 | Requests in flight per namespace | One | Many (tagged queuing) | Many (tagged queuing) |
 | Controller discovery | Bus:slot from `SCSIPORT.PDR`, then a bus scan (claim table for several controllers) | ScsiPort (NT 3.50+), own scan through ports `CF8h`/`CFCh` on NT 3.1 | PnP resources |
 | Register mapping | VMM `_MapPhysToLinear` | `ScsiPortGetDeviceBase` | `ScsiPortGetDeviceBase` |
@@ -142,12 +144,13 @@ It seemed like a good idea at first.
 - Single I/O queue pair (no multi-queue)
 - No MSI/MSI-X; the interrupt path uses legacy INTx (a controller that only does MSI runs with Fast Polling once the watchdog notices)
 - At most 32 (or 16 in the fallback) large transfers in flight at once, limited by the PRP list page pool
-- No namespace management (namespaces are only discovered); namespaces with metadata (MS ≠ 0) or protection information are skipped
-- No Host Memory Buffer: DRAM-less SSDs that rely on HMB run at their slower no-HMB speed (ScsiPort gives a miniport only one block of DMA memory, before the controller can be asked how much HMB it wants)
-- Windows 9x: Fast Polling unless `IRQ=1`; `SCSIPORT.PDR` sends one request per device at a time
+- Namespace administration only through the `NvmeMini` pass-through and `nvmecfg /ns` (no Device Manager page for it); the destructive commands need `ADMIN=1`
+- Namespaces with metadata inside each block (extended LBA) or with more than 16 bytes of separate metadata per block are skipped; metadata is not passed to or from Windows (zeros on write)
+- Host Memory Buffer not on Windows 9x (the VMM's contiguous memory is not taken by the 9x build); on NT 3.1–4.0, which cannot tell the RAM size, at most 16 MB and only on a large system; tested against a QEMU patched to ask for one, not on a DRAM-less SSD
+- Windows 9x: `SCSIPORT.PDR` sends one request per device at a time
 - Windows 9x and BIOS-served disks: an NVMe disk the BIOS also serves through INT 13h (an NVMe option ROM, SeaBIOS) can appear twice, once through nvment9x and once in MS-DOS compatibility mode (a drive that hangs when accessed), as with AHCINT and MMCSDNT; do not use the compatibility-mode drive
 - Windows before 7 sends no TRIM: deallocation happens through UNMAP pass-through or `trimnt` only
-- APST is off by default and was not tested on hardware (QEMU's controller has none)
+- APST (on by default) was run against a QEMU patched to report it, not on hardware; `APST=0` turns it off
 - Namespaces of 2 TB and more: Windows 9x, NT 3.1–4.0, 2000 and XP x86 address at most the first 2 TB; XP x64 and Server 2003 SP1 and later see the whole namespace. See [Namespaces of 2 TB and more](#namespaces-of-2-tb-and-more)
 - QUERY_INFO reports the NSID, block size and size of the first eight namespaces only (the `NVMENT_INFO` layout is unchanged)
 - Tested primarily in virtual machines (QEMU); nvme2k was also tested on Windows 2000 RC2 on Alpha. Reports from real hardware are welcome
@@ -208,6 +211,8 @@ Compile every `.c` file in `src\` with `-ffreestanding -fno-builtin`, `-mrtd` on
 
 `tools\mkpp.sh` builds `nvmentpp.dll` (and the pages of the sibling drivers) from `tools\portpage.c` with MinGW-w64, x86 into `pp\i386` and x64 into `pp\amd64`. The DLL uses no C runtime: it imports only `kernel32`, `user32`, `advapi32`, `setupapi` and `comctl32` functions that Windows 2000 has.
 
+`tools\mkcfg.sh` builds the port programs (`ahcicfg.exe`, `identcfg.exe`, `nvmecfg.exe`, `mmccfg.exe`) from the same `tools\portpage.c` with `PP_EXE`: x86, no C runtime, only `kernel32`, `user32` and `advapi32` functions that Windows NT 3.1 and 95 have (see [Port program](#port-program-nt-3140-9xme)).
+
 ## Installation
 
 ### Installation Media
@@ -257,7 +262,7 @@ Windows 9x/Me setup itself runs through the BIOS (INT 13h), so there is no F6-st
 
 If the protected-mode driver fails to load, Windows 9x falls back to MS-DOS compatibility mode for the affected disks (check **Device Manager → Performance** and `BOOTLOG.TXT`).
 
-> **Windows 95 RTM users:** if the controller shows a **yellow exclamation mark** in Device Manager, the original Windows 95 `SCSIPORT.PDR` is the problem. Either install the [AMDK6 Update](https://winworldpc.com/download/c3a0c2b0-c398-c2a8-3e02-11c3a6e28094), or extract `SCSIPORT.PDR` from that update and copy it to `WINDOWS\SYSTEM\IOSUBSYS` yourself — rename the existing `SCSIPORT.PDR` there to `SCSIPORT.BKP` first so you keep a backup.
+> **Windows 95 RTM:** the original `SCSIPORT.PDR` (4.00.952) works. The cross-compiled builds before this release showed a **yellow exclamation mark** ("Init Failure") there and with the AMDK6 update's `SCSIPORT.PDR` (4.00.1112) alike: both refuse a `HW_INITIALIZATION_DATA` larger than 4Ch bytes, and the MinGW headers made it 50h; the 9x build now passes 4Ch, as the DDK build always did.
 
 #### GUI-mode setup (Windows 2000/XP/XP x64/Server 2003)
 
@@ -291,15 +296,19 @@ On Windows 9x/Me, `nvment9x.inf` registers the controller with `DevLoader = *IOS
 
 ### Driver parameters
 
-On the NT family the driver reads the ScsiPort argument string: the `REG_SZ` value `DriverParameters` (or `DriverParameter`) under `HKLM\SYSTEM\CurrentControlSet\Services\NVMENT\Parameters\Device` (create the keys if they are missing; reboot to apply). On Windows 95/98/Me `SCSIPORT.PDR` passes the string value `AdapterSettings` of the controller's driver key (`HKLM\System\CurrentControlSet\Services\Class\SCSIAdapter\000n`, the one whose `PortDriver` is `nvment9x.mpd`), for example `"AdapterSettings"="IRQ=1"`.
+On the NT family the driver reads the ScsiPort argument string: the `REG_SZ` value `DriverParameters` (or `DriverParameter`) under `HKLM\SYSTEM\CurrentControlSet\Services\NVMENT\Parameters\Device` (create the keys if they are missing; reboot to apply). On Windows 95/98/Me `SCSIPORT.PDR` passes the string value `AdapterSettings` of the controller's driver key (`HKLM\System\CurrentControlSet\Services\Class\SCSIAdapter\000n`, the one whose `PortDriver` is `nvment9x.mpd`), for example `"AdapterSettings"="HOTPLUG=1"`.
 
 | Value | Effect |
 |---|---|
 | `IRQ=0` | No interrupt: every command is Fast Polling (any version) |
-| `IRQ=1` | Windows 9x, and NT 3.1 (no PCI slot information): connect the interrupt line from PCI configuration space |
-| `APST=1` | Autonomous power state transitions on (controllers that report APSTA) |
+| `IRQ=1` | NT 3.1 (no PCI slot information): connect the interrupt line from PCI configuration space. On 9x the interrupt is used by default since 3.2.0.0 |
+| `APST=0` | Autonomous power state transitions off (on by default for controllers that report APSTA) |
+| `HMB=0` / `HMB=n` | Host Memory Buffer off, or at most n MB (default: what the controller prefers, up to 64 MB and 1/16 of the RAM) |
 | `OFF=list` | Namespaces the driver leaves out, by NSID, separated by commas: `OFF=3,4` hides namespaces 3 and 4 of every controller; a PCI location `bus.device.function:` in front (decimal, as Device Manager shows it) limits an item to one controller: `OFF=2.0.0:5`. At most 16 items. The remaining namespaces move up: the LUN numbering counts only the namespaces that are presented |
 | `RC16=1` / `RC16=0` | READ CAPACITY(10) reports `FFFFFFFFh` for a namespace of 2 TB or more (`RC16=1`, for a class driver or filter that then reads READ CAPACITY(16)), or `FFFFFFFEh` (`RC16=0`); the default depends on the Windows version, see [Namespaces of 2 TB and more](#namespaces-of-2-tb-and-more) |
+| `4K=1` | A namespace of 2 TB or more with 512-byte namespace blocks is shown with 4096-byte blocks (eight namespace blocks each), so the systems that address 32-bit block numbers (NT 3.1–4.0, 9x, 2000, XP x86) reach up to 16 TB of it instead of the first 2 TB. For data namespaces partitioned after the switch; see [Namespaces of 2 TB and more](#namespaces-of-2-tb-and-more) |
+| `HOTPLUG=0` / `HOTPLUG=1` | By default on NT 3.1 to XP x64 a controller that went away fails its requests at once; `HOTPLUG=0` turns that off. `HOTPLUG=1` also lets namespaces attached to or detached from the controller at run time come and go (and on 95/98/Me turns the controller check on). See [Hot plug](#hot-plug) |
+| `ADMIN=1` | Destructive and controller-wide admin commands through the `NvmeMini` pass-through: Format NVM, Sanitize, Namespace Management and Attachment, Firmware Download and Commit, Security Send/Receive, and Set Features beyond the harmless ones. Off by default; see [Administration](#administration) |
 
 Several values are separated by spaces. The crash dump / hibernation instance is recognized by the `DUMP=` string ScsiPort passes to it.
 
@@ -313,7 +322,15 @@ On Windows 2000, XP and Server 2003 (x86 and x64) the controller's properties in
 - **OK** or **Apply** stores the string. Device Manager then restarts the controller, which takes effect at once for a controller without the system disk, page file or hibernation file, or asks for a restart of the computer.
 - Writing the value needs administrator rights (it is under `HKLM`).
 
-NT 3.1–4.0 have no Device Manager: there `OFF=` goes into the registry by hand, as above. On Windows 9x/Me it goes into `AdapterSettings`.
+### Port program (NT 3.1–4.0, 9x/Me)
+
+NT 3.1–4.0 have no Device Manager, and the Device Manager of Windows 95/98/Me takes no such page. There `nvmecfg.exe` (in `bin\NT` and `bin\9X`, built from the same `tools\portpage.c`) shows the same list in a window of its own; it also runs on 2000/XP:
+
+- **Controller** lists the NVMENT controllers. On NT 3.1–4.0 they are found through ScsiPort (`HKLM\HARDWARE\DEVICEMAP\Scsi`, `\\.\ScsiN:`), with the namespaces and their devices as the controller reports them and its PCI location from the GET_LOCATION IOCTL; the string is `DriverParameters`, as above. On 9x/Me they are the driver keys whose `PortDriver` is the miniport; each controller has its own `AdapterSettings` string, and since 9x offers no way to ask the miniport, the usual namespaces are listed without devices (other items can be typed into the box).
+- Select a line and press **Turn on / off** (or double-click it); `[X]` is on. The box below shows the whole string and can be edited directly.
+- **Store** writes the string; it takes effect when Windows is started the next time. Writing needs administrator rights on NT.
+- `nvmecfg.exe /t <n> <file> [items]` writes controller n's list to a file and, with items (`OFF=` bodies separated by commas, `-` for none), stores the string with exactly those turned off (for scripted tests).
+
 
 ### Build-time limits
 
@@ -340,7 +357,44 @@ A debug build (`NVMENT_DBG`) writes its messages through `ScsiDebugPrint()`, pre
 ### I/O Model
 
 - **Interrupt:** a read or write is submitted to the I/O submission queue and `HwStartIo` returns; `HwInterrupt` processes the completion queues and completes the requests. With tagged queuing ScsiPort keeps sending requests while earlier ones are in flight. While commands are outstanding a 100 ms ScsiPort timer also processes the queues; when it finds completions that no interrupt reported five times, interrupts are masked (INTMS) and the driver continues with Fast Polling.
-- **Fast Polling:** the command is submitted and the queues are polled every 10 µs until it completes, at most until the request's own timeout minus one second (10 s when the request carries none, 60 s at most), so ScsiPort's own timeout handling never races a request the miniport is about to complete.
+- **Fast Polling:** the command is submitted and the queues are polled (back to back for the first 64 checks, then every microsecond) until it completes, at most until the request's own timeout minus one second (10 s when the request carries none, 60 s at most), so ScsiPort's own timeout handling never races a request the miniport is about to complete.
+
+### Hot plug
+
+The driver's timer (the one the interrupt watchdog uses) runs once a second. Both parts below are on by default on NT 3.1 to XP x64 (`HOTPLUG=0` turns them off; on 95/98/Me only with `HOTPLUG=1`):
+
+- Every check reads `CSTS`, one register read and no command. A controller whose registers read all ones is gone (pulled, or powered off underneath the driver): what it had in flight is returned at once with `SRB_STATUS_SELECTION_TIMEOUT` instead of running into ScsiPort's timeout, and the controller is set up again on the next request if it answers again.
+- Asynchronous events: the driver keeps an Asynchronous Event Request outstanding, with SMART / health critical warnings, Namespace Attribute Notices and Firmware Activation Notices enabled where the controller has them (`OAES`). When the controller reports an event, the timer reads its log page (which clears it) and asks for the next one. A namespace change (attached, detached, created, deleted) makes the driver read the active namespace list once; nothing is read while nothing happens.
+- Only with `HOTPLUG=1`, for controllers without Namespace Attribute Notices: every second check reads the active namespace list (Identify CNS 02h, NVMe 1.1 and later), an admin command that waits at most 100 ms (if the controller does not answer in time, the list is not read again until the next boot). A namespace that left keeps its LUN without a namespace: its requests fail and REPORT LUNS no longer lists it. The same namespace back (same NSID and size) gets its old LUN again; any other new namespace gets the next free LUN, never a LUN another namespace had, since all namespaces of a controller show the same INQUIRY data. `OFF=` applies to new namespaces too. Windows 2000 did not find a new LUN behind the gap a namespace left, so a different namespace attached after another one went away may only appear after the next boot.
+
+The namespace list is not polled by default: a controller with Namespace Attribute Notices reports the change itself, and polling is a command every two seconds. A namespace changed by the driver's own pass-through (attach, detach, management, format, sanitize) is read again in any case.
+
+Windows 2000, XP and x64 are told of a namespace change (`BusChangeDetected`) and the disks come and go. Windows NT 3.1–4.0 and 95/98/Me give a miniport no way to report new devices: a namespace that left fails its requests, and a new one is seen at the next boot. Hot plug of the controller itself (PCIe hot plug) needs the system's support for it, which these Windows versions do not have; the driver only makes sure a controller that is gone does not hang the requests.
+
+### Administration
+
+The `NvmeMini` signature of `IOCTL_SCSI_MINIPORT` (the pass-through SMART tools such as CrystalDiskInfo use) takes an `NVME_PASS_THROUGH` structure with a 64-byte admin command and up to 4 KB of data either way (`Direction` 1 to the controller, 2 from it). The completion entry comes back in `Completion[]` (the NVMe status in `Completion[3]` bits 31:17), also when the command failed; `ReturnCode` is then 1.
+
+| Commands | Taken |
+|---|---|
+| Identify, Get Log Page, Get Features, Device Self-test; Set Features for temperature thresholds (04h), error recovery (05h), volatile write cache (06h), timestamp (0Eh), thermal management (10h) | Always |
+| Format NVM, Sanitize, Namespace Management, Namespace Attachment, Firmware Image Download and Commit, Security Send/Receive, Set Features for other features | With `ADMIN=1` |
+| Queue creation and deletion, Abort, Asynchronous Event Request, Set Features for the number of queues (07h), event configuration (0Bh) and host memory buffer (0Dh) | Never (the driver owns them) |
+
+After a namespace attachment, management, format or sanitize the driver reads the namespace list again; a namespace whose size or format changed becomes a new disk (a new LUN). Windows 2000/XP/x64 see the change at once; NT 3.1–4.0 and 9x at the next boot. A format or sanitize destroys the data of the namespace (or of all of them) at once; Windows is not asked.
+
+`nvmecfg.exe` does the namespace administration from the command line (it also runs on 2000/XP): `nvmecfg /ns <controller> <out file> <action>` with
+
+- `list`: the controller's namespaces (allocated and attached), their size, format and metadata, and the controller's capacity
+- `create <MB> [format]`, `delete <nsid>`: Namespace Management (controllers with `OACS` bit 3)
+- `attach <nsid>`, `detach <nsid>`: Namespace Attachment to this controller
+- `format <nsid> [format]`: Format NVM with LBA format n (default 0), no secure erase
+
+The result goes to the out file; all but `list` need `ADMIN=1`.
+
+### Namespaces with metadata
+
+A namespace whose LBA format has metadata (MS ≠ 0) is used when the metadata is kept apart from the blocks: protection information alone (MS = 8 with end-to-end protection on) is inserted and stripped by the controller (PRACT); other metadata, up to 16 bytes per block, goes to a page of the PRP pool for each command (zeros on write, dropped on read), with protection information in it generated and checked by the controller. To keep that within one page, the largest transfer is reduced at start (to 128 KB with 16 bytes and 512-byte blocks) when such a namespace is there; one that arrives later and does not fit is skipped. Metadata inside each block (extended LBA) cannot be shown as plain blocks and is skipped.
 
 ### IOCTL interface
 
@@ -348,9 +402,10 @@ A debug build (`NVMENT_DBG`) writes its messages through `ScsiDebugPrint()`, pre
 
 | Code | Function |
 |---|---|
-| `1000h` QUERY_INFO | Optional `NVMENT_INFO` after the header: driver and NVMe version, flags (bit 0 Fast Polling, bit 1 powered down, bit 2 write cache, bit 3 TRIM mode, bit 4 APST), LUN count, power state, maximum transfer, deepest queue, interrupt count, NSID / block size / size of every LUN |
+| `1000h` QUERY_INFO | Optional `NVMENT_INFO` after the header: driver and NVMe version, flags (bit 0 Fast Polling, bit 1 powered down, bit 2 write cache, bit 3 TRIM mode, bit 4 APST, bit 5 host memory buffer), LUN count, power state, maximum transfer, deepest queue, interrupt count, NSID / block size / size of every LUN |
 | `1001h` TRIM_MODE_ON | A 4 KB pattern after the header; writes of that pattern become deallocates |
 | `1002h` TRIM_MODE_OFF | Back to normal writes |
+| `1003h` GET_LOCATION | A `ULONG` after the header: the controller's PCI location, bus in bits 31:16, device in 15:8, function in 7:0 (for the port program on NT 3.1–4.0) |
 | `1010h` POWER_DOWN | Waits for queued commands, shutdown notification, controller disabled; the next request or POWER_UP brings it back |
 | `1011h` POWER_UP | Set the controller up again |
 
@@ -371,7 +426,11 @@ Windows versions before 7 never send TRIM or UNMAP for deleted files. `TRIM_MODE
 
 ### APST
 
-With `APST=1` and a controller that reports APSTA (Identify Controller byte 265), the driver builds the autonomous power state transition table (Set Features 0Ch) from the power state descriptors: every power state goes to the deepest non-operational state below it whose exit latency is at most 100 ms, after an idle time of 50 times that state's entry plus exit latency (the rule Linux uses). It is off by default because some early controllers and virtual machines handle APST badly.
+For a controller that reports APSTA (Identify Controller byte 265) the driver builds the autonomous power state transition table (Set Features 0Ch) from the power state descriptors: every power state goes to the deepest non-operational state below it whose exit latency is at most 100 ms, after an idle time of 50 times that state's entry plus exit latency (the rule Linux uses). On by default; `APST=0` turns it off (some early controllers handle APST badly). Before a shutdown notification (`SRB_FUNCTION_SHUTDOWN`, `HwAdapterControl` stop, `HwAdapterState`, the POWER_DOWN IOCTL) APST is turned off and power state 0 set, so the controller takes the shutdown at full power; the next set-up turns APST on again.
+
+### Host Memory Buffer
+
+A DRAM-less SSD keeps part of its tables in host memory if the host gives it some (Identify Controller HMPRE/HMMIN). At `HwFindAdapter` (passive level) the driver takes the preferred size, at most 64 MB (`HMB=n`: n MB) and 1/16 of the RAM (`ZwQuerySystemInformation`; NT 3.1–4.0, which cannot tell the size: 16 MB on a large system as `MmQuerySystemSize` reports it, none otherwise), in pieces of up to 4 MB from `MmAllocateContiguousMemory` (never smaller than the controller's minimum piece, at most 256 pieces or the controller's limit), and gives it with Set Features 0Dh. Less than the controller's minimum: nothing is given and the memory goes back. The buffer is kept while the system runs; after a reset, a power transition or a hot-plug return the same buffer is given again (as new memory, without "memory return"). Not on 9x, not in the dump instance. `HMB=0` turns it off. QUERY_INFO flag bit 5 shows it in use.
 
 ### Windows 9x specifics
 
@@ -379,7 +438,8 @@ With `APST=1` and a controller that reports APSTA (Identify Controller byte 265)
 - **DMA memory:** `SCSIPORT.PDR`'s uncached extension is not physically contiguous; the queues and every PRP list page get their own physical address.
 - **Several controllers:** `SCSIPORT.PDR` calls `HwFindAdapter` for every PCI function; a claim table keeps one controller from being taken twice.
 - **`HwAdapterState`:** provided, as `SCSIPORT.PDR` requires it for PCI miniports.
-- **One request per device** at a time and Fast Polling by default (`IRQ=1` connects the interrupt).
+- **One request per device** at a time; the device node's interrupt is used (up to 3.2.0.0 only with `IRQ=1`), `IRQ=0` in `AdapterSettings` turns it off.
+- **`HW_INITIALIZATION_DATA` size:** `SCSIPORT.PDR` (4.00.952 and the AMDK6 update's 4.00.1112) fails `ScsiPortInitialize` for a structure larger than 4Ch bytes before any `HwFindAdapter` call ("Init Failure"); the 9X build passes 4Ch.
 
 ### Windows NT 3.1 specifics
 
@@ -396,15 +456,22 @@ Before reporting the controller's interrupt line to ScsiPort, the NT build asks 
 
 ### Windows 2000/XP/x64 specifics
 
+- **SMART through the disk:** `disk.sys` sends `SMART_GET_VERSION`, `SMART_RCV_DRIVE_DATA` and `SMART_SEND_DRIVE_COMMAND` (and its own failure prediction) as `IOCTL_SCSI_MINIPORT` to the disk's PDO. The ScsiPort of XP x64 / Server 2003 SP1 x64 (5.2.3790.1830; the XP and Server 2003 x86 ScsiPorts were not examined, the Windows 2000 one passes it on) accepts that IOCTL only on the adapter's device object and answers it on a PDO with `STATUS_INVALID_DEVICE_REQUEST`, so `\\.\PhysicalDriveN` had no SMART there (`\\.\ScsiN:` had). `DriverEntry` installs a front end on `IRP_MJ_DEVICE_CONTROL` (`src\nvmepdo.c`): an `IOCTL_SCSI_MINIPORT` on a PDO (any device object of the driver that is not `FILE_DEVICE_CONTROLLER`) at `PASSIVE_LEVEL` is sent through that PDO as the `SRB_FUNCTION_IO_CONTROL` request ScsiPort builds for the adapter (with an MDL for the buffer), and ScsiPort puts the disk's address into it. The miniport sees the same request on every 2000/XP version.
 - **PnP adapter:** the PCI bus driver enumerates the controller and ScsiPort starts NVMENT with its BAR and interrupt.
 - **Text-mode setup (F6):** `Parameters\PnpInterface\5` is created by `DriverEntry` when missing (see [Text-mode (F6) setup](#text-mode-f6-setup--windows-2000xpxp-x64server-2003)).
-- **Hibernation and crash dump:** the dump stack instance runs with Fast Polling and a small (16 KB) DMA area; its queues are aligned on the physical address, since the dump stack's DMA buffer does not start on a page boundary.
+- **Hibernation and crash dump:** the dump stack instance runs with Fast Polling and a small (16 KB) DMA area; its queues are aligned on the physical address, since the dump stack's DMA buffer does not start on a page boundary. Tested on Windows 2000 and XP x64 (two hibernation cycles each; on Windows 2000 with HMB and APST, which are set up again after each resume). S3/S4 need every device to agree; a VGA adapter without a driver (VgaSave) vetoes them, which has nothing to do with NVMENT; under QEMU, `-vga cirrus` with the in-box Cirrus Logic 5446 driver (Windows 2000) or the in-box *Standard VGA Graphics Adapter* (`display.inf`, `vgapnp.sys`) on the std VGA (XP x64, installed by hand when Windows did not pick it) lets S4 through.
 
 ### Namespaces of 2 TB and more
 
 A namespace whose last LBA is `FFFFFFFFh` or beyond does not fit READ CAPACITY(10). The SCSI answer is `FFFFFFFFh`, which tells the class driver to read READ CAPACITY(16). The disk class drivers of Server 2003 SP1 and XP x64 (and later) do; those of NT 3.1–4.0, Windows 9x, 2000 and XP x86 do not: they add one to the value in 32 bits and see a disk of 0 bytes. The driver therefore answers `FFFFFFFEh` (2 TB minus one block) where the class driver does not know READ CAPACITY(16): those systems see and use the first 2 TB, which is all they can address with READ(10)/WRITE(10) and an MBR anyway. READ CAPACITY(16) and 16-byte CDBs always give the whole namespace.
 
 The choice is made once at load time: the NT and 9x builds always clip; the 2000/XP x86 build asks `PsGetVersion` (Server 2003 with a service pack, or later, reads READ CAPACITY(16)); the x64 build never clips. `RC16=1` / `RC16=0` in the driver parameters override it. The same rule is used by AHCINT, IDENT and MMCSDNT.
+
+**`4K=1`** (opt-in) goes past that limit on those systems: a namespace of 2 TB or more with 512-byte namespace blocks is shown with 4096-byte blocks. The driver multiplies block numbers and counts by eight on the way to the controller (READ/WRITE, VERIFY, TRIM ranges), and READ CAPACITY, MODE SENSE and the block limits report 4096-byte blocks; 32-bit block numbers then reach 16 TB, and an MBR partitioned in 4096-byte units holds up to 16 TB as well. Namespaces with 4096-byte sectors of their own, and smaller ones, are not changed.
+
+- Use it for data namespaces only, and partition and format them after turning it on: partitions made with 512-byte sectors are not found in 4096-byte units, and back. A boot namespace is read by the BIOS in 512-byte sectors and does not work with it.
+- What the file systems make of 4096-byte sectors is as for 4096-byte namespaces (see the logical sector table in the AHCINT README: NT 3.1 NTFS only, Windows 95 not usable).
+- Tested with a 3 TB image on Windows 2000: shown as 3 TB with 4096 bytes per sector, writes and reads at 0, 1 TB, just below and above 2 TB, 2.5 TB and the end of the namespace, each found at its byte offset in the image.
 
 ### Memory Allocation
 
@@ -434,6 +501,23 @@ FFFDh / FFFEh: delete I/O CQ / SQ at shutdown
 ```
 
 ## Version history
+
+### 3.2.0.0 — 2026-11-02
+
+- XP x64: SMART through `\\.\PhysicalDriveN` (`disk.sys`), which that ScsiPort refused on the disk's PDO; see [Windows 2000/XP/x64 specifics](#windows-2000xpx64-specifics).
+- `4K=1`: a namespace of 2 TB or more with 512-byte sectors is shown with 4096-byte blocks, so NT 3.1–4.0, 9x, 2000 and XP x86, which address 32-bit block numbers, reach up to 16 TB of it instead of the first 2 TB. Opt-in, for data namespaces partitioned after the switch; see [Namespaces of 2 TB and more](#namespaces-of-2-tb-and-more).
+- Port program `nvmecfg.exe` for Windows NT 3.1–4.0 and 95/98/Me (in `bin\NT` and `bin\9X`; it also runs on 2000/XP): the list and parameter box of the Device Manager page in a window of its own, for the systems that have no such page. On 9x/Me it edits the `AdapterSettings` of the chosen controller. See [Port program](#port-program-nt-3140-9xme).
+- `GET_LOCATION` (`1003h`, signature `NVMENT  `) miniport IOCTL: the controller's PCI location, used by the port program on NT 3.1–4.0.
+- A controller whose registers read all ones (pulled, powered off) has its requests returned at once; on by default on NT 3.1 to XP x64, `HOTPLUG=0` turns it off (on 9x only with `HOTPLUG=1`).
+- Asynchronous events: an Asynchronous Event Request is kept outstanding (SMART / health warnings, namespace attribute and firmware activation notices); a namespace attached, detached, created or deleted is picked up when the controller reports it, without polling (Windows 2000/XP/x64 are told with `BusChangeDetected`). On by default with the hot-plug check. `HOTPLUG=1` also polls the namespace list every 2 s for controllers without these notices; a namespace that comes back gets its old LUN. See [Hot plug](#hot-plug).
+- Administration through the `NvmeMini` pass-through: Get/Set Features, Device Self-test and any Identify or log page always; Format NVM, Sanitize, Namespace Management and Attachment, firmware download and commit and Security Send/Receive with `ADMIN=1`. The completion entry, with the NVMe status, comes back also for a failed command. `nvmecfg /ns` lists, creates, deletes, attaches, detaches and formats namespaces. See [Administration](#administration).
+- Namespaces with metadata: protection information only (MS = 8) through PRACT, separate metadata up to 16 bytes per block through a pool page per command (they were skipped before). See [Namespaces with metadata](#namespaces-with-metadata).
+- Polling, where no interrupt is used: the first checks follow each other without a pause, then one per microsecond instead of every 10 µs.
+- Interrupts on by default on Windows 95/98/Me (`IRQ=1` was needed).
+- Host Memory Buffer (NT 3.1 to XP x64), on by default (`HMB=0` off, `HMB=n` at most n MB). See [Host Memory Buffer](#host-memory-buffer).
+- APST on by default (`APST=0` off; it was `APST=1` to turn it on); APST off and power state 0 before every shutdown notification.
+- Windows 95 "Init Failure" of the cross-compiled 9x build fixed: `HW_INITIALIZATION_DATA` is passed with the 4Ch bytes `SCSIPORT.PDR` accepts (it was 50h).
+- The interrupt watchdog and the hot-plug check share one timer; a timer request while one is pending is no longer passed to ScsiPort (the pending one asks again when it runs).
 
 ### 3.1.0.0 — 2026-10-19
 
@@ -494,7 +578,6 @@ This project is licensed under the **3-Clause BSD License**; see the [LICENSE](L
 - Ray Hinchliffe for build contributions and extensive testing of nvme2k
 - SweetLow for taking it even further into the realm of insanity aka win9x ([nvme9x](https://github.com/LordOfMice/Tools))
 - infuscomus for porting the sibling drivers to x64
-- Dietmar for the Fast Polling idea
 - Folks from the Win2kdev Discord and Vogons
 - The NVM Express specification authors
 - Windows 2000 DDK documentation and the Alpha AXP architecture documentation

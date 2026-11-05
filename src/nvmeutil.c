@@ -986,6 +986,25 @@ static PCHAR ParseDecimal(IN PCHAR P, OUT PULONG Value)
     return (P == start) ? NULL : P;
 }
 
+//
+// ArgDecimal - the decimal value after "key" (KEY=n), Default without one
+//
+ULONG ArgDecimal(IN PCHAR Args, IN PCHAR Key, IN ULONG Default)
+{
+    ULONG i, j, v;
+    CHAR a;
+
+    for (i = 0; Args != NULL && Args[i] != 0; i++) {
+        for (j = 0; Key[j] != 0; j++) {
+            a = Args[i + j];
+            if (a >= 'a' && a <= 'z') a = (CHAR)(a - 'a' + 'A');
+            if (a != Key[j]) break;
+        }
+        if (Key[j] == 0 && ParseDecimal(&Args[i + j], &v) != NULL) return v;
+    }
+    return Default;
+}
+
 VOID ParseNamespacesOff(IN PHW_DEVICE_EXTENSION DevExt, IN PCHAR Args)
 {
     ULONG i, j, n, v[4], count, colon;

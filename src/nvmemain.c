@@ -303,6 +303,10 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     // Set size of structure: NT 3.50-4.0 accept it up to DeviceId
 #ifdef NVMENT_NT31_COMPAT
     hwInitData.HwInitializationDataSize = NVMENT_HWINIT_SIZE_NT35;
+#elif defined(NVMENT_W9X)
+    /* SCSIPORT.PDR fails any structure larger than 4Ch bytes (up to
+       DeviceId) with "Init Failure", before HwFindAdapter is called */
+    hwInitData.HwInitializationDataSize = (ULONG)FIELD_OFFSET(HW_INITIALIZATION_DATA, DeviceId) + sizeof(PVOID);
 #else
     hwInitData.HwInitializationDataSize = sizeof(HW_INITIALIZATION_DATA);
 #endif
@@ -372,6 +376,9 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     }
 #endif
 
+#if (_WIN32_WINNT >= 0x500)
+    if (!g_DumpMode && status == 0) NvmeHookDeviceControl(DriverObject);
+#endif
 #ifdef NVMENT_DBG
     ScsiDebugPrint(0, "NVMENT: DriverEntry exiting with status 0x%08X\n", status);
 #endif
@@ -443,11 +450,6 @@ ULONG HwFoundAdapter(
         if (!HasSlot && !ArgPresent(ArgumentString, "IRQ=1")) {
             interruptPin = 0;
         }
-#ifdef NVMENT_W9X
-        if (!ArgPresent(ArgumentString, "IRQ=1")) {
-            interruptPin = 0;
-        }
-#endif
         if (ArgPresent(ArgumentString, "IRQ=0")) {
             interruptPin = 0;
         }
@@ -497,10 +499,24 @@ ULONG HwFoundAdapter(
     // Fast Polling (completions polled in HwStartIo) without an interrupt,
     // in the dump stack and with "IRQ=0"
     DevExt->DumpMode = (BOOLEAN)(g_DumpMode || ArgPresent(ArgumentString, "DUMP="));
-    DevExt->ApstAllowed = ArgPresent(ArgumentString, "APST=1");
+    // Autonomous power state transitions and the host memory buffer: on
+    // unless APST=0 / HMB=0 (HMB=n: at most n MB)
+    DevExt->ApstAllowed = (BOOLEAN)!ArgPresent(ArgumentString, "APST=0");
+    DevExt->HmbCapMb = ArgDecimal(ArgumentString, "HMB=", 0);
+    DevExt->HmbAllowed = (BOOLEAN)!ArgPresent(ArgumentString, "HMB=0");
     DevExt->Capacity16 = g_Capacity16;
     if (ArgPresent(ArgumentString, "RC16=1")) DevExt->Capacity16 = TRUE;
     if (ArgPresent(ArgumentString, "RC16=0")) DevExt->Capacity16 = FALSE;
+    DevExt->Sector4K = ArgPresent(ArgumentString, "4K=1");
+    // Controller check: on unless HOTPLUG=0 (9x only with HOTPLUG=1);
+    // namespaces come and go only with HOTPLUG=1
+#ifdef NVMENT_W9X
+    DevExt->HotPlug = (BOOLEAN)(ArgPresent(ArgumentString, "HOTPLUG=1") && !DevExt->DumpMode);
+#else
+    DevExt->HotPlug = (BOOLEAN)(!ArgPresent(ArgumentString, "HOTPLUG=0") && !DevExt->DumpMode);
+#endif
+    DevExt->HpNamespaces = (BOOLEAN)(DevExt->HotPlug && ArgPresent(ArgumentString, "HOTPLUG=1"));
+    DevExt->AdminAll = (BOOLEAN)ArgPresent(ArgumentString, "ADMIN=1");
     ParseNamespacesOff(DevExt, ArgumentString);
     DevExt->PollMode = (BOOLEAN)(DevExt->DumpMode || ArgPresent(ArgumentString, "IRQ=0") ||
                                  (ConfigInfo->BusInterruptLevel == 0 && ConfigInfo->BusInterruptVector == 0));
@@ -754,6 +770,7 @@ ULONG HwFoundAdapter(
 #endif
         return SP_RETURN_ERROR;
     }
+    NvmeSetupHmb(DevExt);
 
 #ifdef NVMENT_DBG
     ScsiDebugPrint(0, "NVMENT: HwFoundAdapter - %s, IRQ level %u\n",
@@ -762,6 +779,8 @@ ULONG HwFoundAdapter(
 
     // We need to update some of the config info now from the data we got from the controller.
     ConfigInfo->MaximumTransferLength = DevExt->MaxTransferSizeBytes;
+    DevExt->TransferReported = TRUE;
+    DevExt->ReportedTransfer = DevExt->MaxTransferSizeBytes;
     if (((ConfigInfo->MaximumTransferLength >> NVME_PAGE_SHIFT) - 1) < ConfigInfo->NumberOfPhysicalBreaks)
         ConfigInfo->NumberOfPhysicalBreaks = (ConfigInfo->MaximumTransferLength >> NVME_PAGE_SHIFT) - 1;
 
@@ -1034,6 +1053,7 @@ BOOLEAN HwInitialize(IN PVOID DeviceExtension)
         NvmeEnableInterrupts(DevExt);
     }
 
+    NvmeArmHotPlug(DevExt);
 #ifdef NVMENT_DBG
     ScsiDebugPrint(0, "NVMENT: HwInitialize finished successfully\n");
 #endif
@@ -1050,6 +1070,11 @@ BOOLEAN HwStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
     PHW_DEVICE_EXTENSION DevExt = (PHW_DEVICE_EXTENSION)DeviceExtension;
     BOOLEAN driverIoctl = FALSE;
     BOOLEAN result;
+
+    if (Srb->SrbExtension != NULL) {
+        ((PNVME_SRB_EXTENSION)Srb->SrbExtension)->PrpListPage = 0xFF;
+        ((PNVME_SRB_EXTENSION)Srb->SrbExtension)->MetaPage = 0xFF;
+    }
 
     // "NVMENT" IOCTLs (info, power down/up) do not wake the controller up
     if (Srb->Function == SRB_FUNCTION_IO_CONTROL && Srb->DataBuffer != NULL &&
@@ -1121,8 +1146,10 @@ static BOOLEAN NvmeStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 
     // Namespace n is target n / 8, LUN n % 8. A controller without
     // namespaces presents no logical unit at all.
+    // A namespace gone at run time (HOTPLUG=1) keeps its LUN without a
+    // namespace: no logical unit there any more
     if (Srb->PathId != 0 || Srb->TargetId >= NVMENT_TARGETS || Srb->Lun >= NVMENT_LUNS_PER_TARGET ||
-        NVME_LUN_INDEX(Srb) >= DevExt->LunCount) {
+        NVME_LUN_INDEX(Srb) >= DevExt->LunCount || DevExt->Luns[NVME_LUN_INDEX(Srb)].NamespaceId == 0) {
         if (Srb->Function == SRB_FUNCTION_EXECUTE_SCSI || Srb->Function == SRB_FUNCTION_IO_CONTROL) {
             ULONG first = (ULONG)Srb->TargetId * NVMENT_LUNS_PER_TARGET;
             Srb->SrbStatus = (UCHAR)((Srb->PathId == 0 && Srb->TargetId < NVMENT_TARGETS && DevExt->LunCount > first) ?
@@ -1341,42 +1368,138 @@ static BOOLEAN NvmeStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
     return TRUE;
 }
 
+static VOID NvmeTimer(IN PVOID DeviceExtension);
+
 //
-// NvmeWatchdog - While commands are outstanding, check the completion queues
-// every 100 ms. Completions found here were not reported by an interrupt;
-// when that keeps happening the interrupt is not delivered (wrong routing,
-// MSI-only device, text-mode setup) and the driver continues with Fast Polling.
+// NvmeHotPlugCheck - A controller whose registers read all ones is gone
+// (surprise removal): what it had in flight is returned at once instead
+// of running into ScsiPort's timeout, and requests fail (on by default,
+// off with HOTPLUG=0). HOTPLUG=1: the namespace list is read again every
+// NVMENT_HOTPLUG_NS_TICKS checks; 2000/XP/x64 are told of a change
+// (BusChangeDetected).
 //
-static VOID NvmeWatchdog(IN PVOID DeviceExtension)
+static VOID NvmeHotPlugCheck(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    ULONG l;
+
+    if (NvmeReadReg32(DevExt, NVME_REG_CSTS) == 0xFFFFFFFF) {
+        if (DevExt->Stopped) {
+            return;
+        }
+#ifdef NVMENT_DBG
+        ScsiDebugPrint(0, "NVMENT: controller gone (CSTS=FFFFFFFF)\n");
+#endif
+        ScsiPortCompleteRequest(DevExt, 0, SP_UNTAGGED, SP_UNTAGGED, SRB_STATUS_SELECTION_TIMEOUT);
+        for (l = 0; l < NVMENT_MAX_LUNS; l++) {
+            DevExt->Luns[l].NonTaggedInFlight = NULL;
+        }
+        DevExt->CurrentQueueDepth = 0;
+        DevExt->PrpListPageBitmap = 0;
+        DevExt->CurrentPrpListPagesUsed = 0;
+        DevExt->Stopped = TRUE;                 // set up again if it answers again
+        return;
+    }
+    if (DevExt->Stopped) {
+        return;
+    }
+    // Events: without an interrupt their completion is found here
+    if (DevExt->PollMode) {
+        NvmeProcessAdminCompletion(DevExt);
+    }
+    if (DevExt->AerLogPending) {
+        NvmeAerReadLog(DevExt);
+    }
+    if (DevExt->NsChangePending) {
+        DevExt->NsChangePending = FALSE;
+        if (NvmeHotPlugNamespaces(DevExt)) {
+#if (_WIN32_WINNT >= 0x500)
+            ScsiPortNotification(BusChangeDetected, DevExt, 0);
+#endif
+        }
+    }
+    if (!DevExt->HpNamespaces || ++DevExt->HpTicks < NVMENT_HOTPLUG_NS_TICKS) {
+        return;
+    }
+    DevExt->HpTicks = 0;
+    if (NvmeHotPlugNamespaces(DevExt)) {
+#if (_WIN32_WINNT >= 0x500)
+        ScsiPortNotification(BusChangeDetected, DevExt, 0);
+#endif
+    }
+}
+
+//
+// NvmeTimer - While commands are outstanding, check the completion queues
+// every 100 ms (the watchdog). Completions found here were not reported by
+// an interrupt; when that keeps happening the interrupt is not delivered
+// (wrong routing, MSI-only device, text-mode setup) and the driver continues
+// with Fast Polling. HOTPLUG=1: the controller and its namespaces are
+// checked.
+//
+static VOID NvmeTimer(IN PVOID DeviceExtension)
 {
     PHW_DEVICE_EXTENSION DevExt = (PHW_DEVICE_EXTENSION)DeviceExtension;
-    BOOLEAN found;
+    BOOLEAN found, pending = FALSE;
+    ULONG elapsed = DevExt->TimerUsec;
 
     DevExt->TimerArmed = FALSE;
-    if (DevExt->PollMode || DevExt->Stopped || !DevExt->InitComplete) {
+    if (!DevExt->InitComplete) {
         return;
     }
-
-    found = NvmeProcessAdminCompletion(DevExt);
-    if (NvmeProcessIoCompletion(DevExt)) {
-        found = TRUE;
+    if (!DevExt->PollMode && !DevExt->Stopped) {
+        found = NvmeProcessAdminCompletion(DevExt);
+        if (NvmeProcessIoCompletion(DevExt)) {
+            found = TRUE;
+        }
+        if (found && ++DevExt->MissedInterrupts >= NVMENT_MISSED_IRQ_LIMIT) {
+            NvmeEnterPollMode(DevExt);
+        } else {
+            pending = (BOOLEAN)(DevExt->CurrentQueueDepth != 0);
+        }
     }
-    if (found && ++DevExt->MissedInterrupts >= NVMENT_MISSED_IRQ_LIMIT) {
-        NvmeEnterPollMode(DevExt);
-        return;
+    if (DevExt->HotPlug) {
+        DevExt->HpElapsed += elapsed;
+        if (DevExt->HpElapsed >= NVMENT_HOTPLUG_USEC) {
+            DevExt->HpElapsed = 0;
+            NvmeHotPlugCheck(DevExt);
+        }
     }
-    if (DevExt->CurrentQueueDepth != 0) {
+    if (pending) {
         NvmeArmWatchdog(DevExt);
     }
+    NvmeArmHotPlug(DevExt);
+}
+
+//
+// One timer per adapter: the watchdog (short) and the hot-plug check
+// (long). A request while one is pending is not passed on: the pending
+// one runs first and asks again, so that ScsiPort never gets a second
+// request for a timer it still holds.
+//
+static VOID NvmeRequestTimer(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Usec)
+{
+    if (DevExt->TimerArmed) {
+        return;
+    }
+    DevExt->TimerArmed = TRUE;
+    DevExt->TimerUsec = Usec;
+    ScsiPortNotification(RequestTimerCall, (PVOID)DevExt, NvmeTimer, Usec);
 }
 
 VOID NvmeArmWatchdog(IN PHW_DEVICE_EXTENSION DevExt)
 {
-    if (DevExt->PollMode || DevExt->TimerArmed || !DevExt->InitComplete) {
+    if (DevExt->PollMode || !DevExt->InitComplete) {
         return;
     }
-    DevExt->TimerArmed = TRUE;
-    ScsiPortNotification(RequestTimerCall, (PVOID)DevExt, NvmeWatchdog, NVMENT_WATCHDOG_USEC);
+    NvmeRequestTimer(DevExt, NVMENT_WATCHDOG_USEC);
+}
+
+VOID NvmeArmHotPlug(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    if (!DevExt->HotPlug || DevExt->Stopped || !DevExt->InitComplete) {
+        return;
+    }
+    NvmeRequestTimer(DevExt, NVMENT_HOTPLUG_USEC);
 }
 
 //
@@ -1395,7 +1518,7 @@ VOID NvmeEnterPollMode(IN PHW_DEVICE_EXTENSION DevExt)
     while (DevExt->CurrentQueueDepth != 0 && wait++ < 1000000) {
         NvmeProcessAdminCompletion(DevExt);
         NvmeProcessIoCompletion(DevExt);
-        ScsiPortStallExecution(NVMENT_POLL_INTERVAL_USEC);
+        ScsiPortStallExecution(10);
     }
 }
 
@@ -1423,8 +1546,7 @@ VOID NvmePollSrb(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb)
         if (Srb->SrbStatus != SRB_STATUS_PENDING) {
             break;
         }
-        ScsiPortStallExecution(NVMENT_POLL_INTERVAL_USEC);
-        elapsed += NVMENT_POLL_INTERVAL_USEC;
+        NVMENT_POLL_STEP(elapsed, 1);
     }
 }
 
@@ -1517,6 +1639,7 @@ SCSI_ADAPTER_CONTROL_STATUS HwAdapterControl(
 #ifdef NVMENT_DBG
             ScsiDebugPrint(0, "NVMENT: ScsiStopAdapter - performing shutdown\n");
 #endif
+            NvmeFullPower(DevExt);
             NvmeShutdownController(DevExt);
             break;
 
@@ -1561,6 +1684,7 @@ BOOLEAN HwAdapterState(
         ScsiDebugPrint(0, "NVMENT: HwAdapterState - saving state and shutting down\n");
 #endif
         // Perform clean shutdown of the NVMe controller
+        NvmeFullPower(DevExt);
         NvmeShutdownController(DevExt);
     } else {
         // Restore adapter state - reinitialize after power up

@@ -1,5 +1,195 @@
 NVMENT 3.0.0.0 - test results (QEMU 8.2, NVMe 1.4 controller "nvme")
 
+Hibernation on Windows 2000 and XP x64 (2026-11-03)
+
+- Display: S4 needs a driver on the display adapter. Windows 2000 with
+  -vga cirrus: the in-box Cirrus Logic 5446 driver (display.inf),
+  installed through SetupAPI. XP x64 with the std VGA: the in-box
+  "Standard VGA Graphics Adapter" (display.inf, vgapnp.sys, which XP x64
+  had not picked for the device), installed the same way. No driver was
+  downloaded: the one free QEMU display driver source found
+  (roytam1/vbemp, VBE miniport for NT 3.x) is x86 only and has no power
+  management, so it would not have let S4 through either.
+- Windows 2000 (256 MB, ACPI HAL, patched QEMU with AHCI link power
+  management, NVMe HMB 8 MB and APST): system disk on AHCINT (ICH9
+  port 0), 256 MB disks on AHCI port 1 (AHCINT), on the PIIX3 primary
+  and secondary master (IDENT; the CD as secondary slave), an NVMe
+  namespace (NVMENT) and an SD card on sdhci-pci (MMCSDNT). Power
+  capabilities S3 1 S4 1, hibernation file reserved. bench.exe on the
+  five data disks, hibernate, resume, bench again, hibernate, resume,
+  bench again: all without errors; DRIVER.CAB from the CD and FC: equal
+  afterwards; IDENTIFY through \\.\PhysicalDriveN still reached each
+  disk (the SD card has none). After the second resume QEMU's log shows
+  APST on, the HMB given again (2048 pages, every descriptor checked)
+  and ALPE set on the AHCI ports; before the final power-off ALPE and
+  ADSE were cleared (full power).
+- XP x64 (512 MB, stock QEMU): system disk on IDENT (PIIX3 primary
+  master), data disks on the primary slave and secondary master
+  (IDENT), AHCI port 1 (AHCINT) and NVMe (NVMENT), the CD as secondary
+  slave. S4 1, hibernation file reserved; the same two cycles with
+  bench.exe before and after each: all without errors, then DRIVER.CAB
+  and FC equal, IDENTIFY through each \\.\PhysicalDriveN.
+- After a resume both systems lock the session; a power-off asked for by
+  a program in that locked session (ExitWindowsEx returned success) did
+  not power the machine off, it stayed at the logon screen. With the
+  password on resume turned off (powercfg /globalpowerflag off /option
+  resumepassword, XP x64) the same program powered off at once after a
+  resume. Windows behaviour, not the drivers'.
+
+SMART through the disk on XP x64 (added to 3.2.0.0, 2026-11-03)
+
+- SMART through \\.\PhysicalDriveN (disk.sys) on XP x64: the request
+  goes to the disk's PDO as IOCTL_SCSI_MINIPORT, which XP x64's ScsiPort
+  (5.2.3790.1830) answers on a PDO with STATUS_INVALID_DEVICE_REQUEST
+  (disassembly of its PDO device-control routine; only the adapter's
+  device object takes it): smartt.exe reported ERROR_INVALID_FUNCTION on
+  every disk of the driver, \\.\ScsiN: answered. The stock atapi.sys
+  (not a ScsiPort miniport) answers on the same image. With the
+  IRP_MJ_DEVICE_CONTROL front end the request is passed through the PDO
+  as SRB_FUNCTION_IO_CONTROL (ScsiPort's PDO routine takes that function
+  and fills in the disk's address).
+- A first build without an MDL in that request stopped XP x64 with
+  STOP D1 in ScsiPort (it maps the data of every request with
+  DATA_IN/DATA_OUT through the IRP's MDL); with the MDL as below.
+- XP x64 SP1 (5.2.3790.1830, ACPI HAL), an installed image moved to
+  QEMU's PIIX3: system disk on the IDE primary master (IDENT), 256 MB
+  disks as primary slave and secondary master, the XP x64 CD as
+  secondary slave, a 256 MB disk on ICH9 AHCI port 1 (AHCINT), a 256 MB
+  NVMe namespace (NVMENT); the three drivers installed with their INFs
+  through SetupAPI. Release builds: bench.exe on the four data disks,
+  DRIVER.CAB from the CD and FC: equal; IDENTIFY through
+  SMART_RCV_DRIVE_DATA on \\.\PhysicalDrive0-4 returned each disk's own
+  serial number (QM00001, PRISLAVE, SECMASTER, AHCIP1, NVME1), SMART READ
+  DATA answered on each; 32-bit and 64-bit test programs; shutdown
+  powered off.
+- Windows 2000 (regression, release builds): IDENTIFY through
+  \\.\PhysicalDriveN returned the serial of each disk of the driver
+  (the 2000 ScsiPort passed these on before as well); bench, DRIVER.CAB
+  and FC, SMART, hot plug and card change as before.
+
+Host Memory Buffer, APST by default (added to 3.2.0.0, 2026-11-02)
+
+QEMU 8.2's NVMe controller has neither; it was patched for these runs:
+with QEMU_NVME_HMB=<KB> it reports HMPRE (that size) and HMMIN (half of
+it) and takes Set Features 0Dh, checking every descriptor (page aligned,
+the sizes adding up to HSIZE) by writing and reading back 16 bytes at
+both ends of every piece; with QEMU_NVME_APST=1 it reports APSTA and two
+non-operational power states (PS1: 1 ms entry / 2 ms exit, PS2: 5 ms /
+20 ms) and takes Set Features 0Ch. Each accepted command is logged.
+- Windows 2000 (256 MB RAM), debug build, no DriverParameters:
+  - controller asking for 32 MB (16 MB minimum): "limit 16344 KB: not
+    given" (1/16 of the RAM is less than the minimum), no Set Features
+    0Dh, the controller runs without a buffer.
+  - controller asking for 8 MB: "8192 KB in 2 piece(s) ... on"; QEMU:
+    2048 pages, 2 descriptors, all checked, accepted.
+  - "APST on"; QEMU: the table entry for PS0 goes to PS1 after 150 ms.
+  - bench.exe on the NVMe disk: no errors; nvmecfg.exe lists the
+    controller and its namespace.
+  - POWER_DOWN and POWER_UP IOCTLs twice (mpctl.exe): QEMU shows APST
+    off before each shutdown notification, the buffer dropped by the
+    controller reset, and APST and the buffer given again (the same
+    descriptors) when the controller is set up again; bench afterwards
+    without errors.
+- Release build of this round, the patched QEMU: the same sequence in
+  QEMU's log (buffer given, APST on; APST off and the buffer dropped at
+  each POWER_DOWN; both given again at POWER_UP), both bench runs
+  without errors. On the unpatched QEMU (no HMPRE, no APSTA): bench and
+  the port program as before.
+- Not tested: a real DRAM-less SSD; NT 3.1-4.0 (MmQuerySystemSize path)
+  and XP x64 (ZwQuerySystemInformation with the 64-bit structure size)
+  were not run with a controller that asks for a buffer.
+
+Windows 9x defaults (added to 3.2.0.0, 2026-11-02)
+
+- The 9x build passes a HW_INITIALIZATION_DATA of 0x4C bytes: the
+  SCSIPORT.PDR of Windows 95 (4.00.952, and 1112) returns 1 for a larger
+  one before HwFindAdapter is called, which the MinGW headers' 0x50-byte
+  structure caused (found with AHCINT9X, see AHCINT's TESTS.TXT).
+- Interrupts are now the default on 9x as on NT (IRQ=0 for Fast Polling;
+  the IRQ=1 opt-in is gone); when interrupts do not arrive the driver
+  goes back to Fast Polling as on the other systems.
+- Not run on 9x in this round (no image with an NVMe controller set up
+  for NVMENT9X here).
+- Release build of this version on Windows 2000 (NVMe data disk,
+  ADMIN=1): bench without errors (err 0 bad 0 at every step), the port
+  program lists the controller and its namespace.
+
+Administration, asynchronous events, metadata (added to 3.2.0.0,
+2026-11-02)
+
+QEMU 8.2 with an NVMe subsystem (nvme-subsys) and four namespaces of
+256 MB: 1 plain, 2 detached at start, 3 with 16 bytes of separate
+metadata per block, 4 with 8 bytes of protection information (type 1).
+Windows 2000, debug build, DriverParameters ADMIN=1 (hot-plug check on
+by default):
+- Start: the driver took namespaces 1, 3 and 4 (before, 3 and 4 were
+  skipped), "asynchronous events 11F, request outstanding".
+- nvmecfg /ns 0 <file> list: all four with size, format and metadata,
+  2 "not attached".
+- attach 2: done; the controller sent a Namespace Attribute Changed
+  event ("event type 2 info 00 log 04"), the driver read the list and
+  "NSID 2 arrived (LUN 3)": a fifth disk in Windows without polling.
+- The test program (writes, reads at queue depths 1 to 32, verify) on
+  namespace 2, on 3 (separate metadata) and on 4 (protection
+  information, PRACT): no error.
+- detach 2: event, "NSID 2 gone", four disks again.
+- format 3 0 (to the format without metadata): done; the driver read
+  the namespaces again, "NSID 3 changed its format" and the namespace
+  came back as a new LUN; namespace 4 was left alone (the first version
+  took it for changed too: its 8 bytes of protection information were
+  compared with the separate metadata size).
+- create 16: "create failed, status 4001" (Invalid Opcode with DNR:
+  QEMU 8.2 has no Namespace Management); the status came back in the
+  completion entry. The first version failed the whole request, so the
+  program saw no status.
+- Not tested: Sanitize, firmware download/commit, Device Self-test,
+  Security Send/Receive (QEMU 8.2 has none of them), the refusal
+  without ADMIN=1 (the check is a table in the driver), SMART events.
+
+Hot plug (added to 3.2.0.0, 2026-11-02; controller check on by default
+on NT, namespaces with HOTPLUG=1)
+
+QEMU 8.2.2 patched for these runs: while /tmp/hp/nvctrl exists, the
+controller's registers read all ones and writes are dropped; while
+/tmp/hp/nsN exists, namespace N is not in the active namespace list and
+its commands fail with Invalid Namespace.
+- Windows 2000, release build, DriverParameters 4K=1 only (controller
+  check by default): registers all ones during the test program's
+  writes: the requests failed and the program ended with errors
+  (expected) instead of waiting for timeouts; registers back: the
+  driver set the controller up again at the next request, full test
+  program run without error.
+- Windows 2000, release build, DriverParameters HOTPLUG=1, two
+  namespaces of 256 MB: namespace 2 detached: its disk left the system
+  (three disks to two); attached again: back at its old LUN, test
+  program on it without error. The first version gave the returning
+  namespace a new LUN behind the gap it left, and Windows 2000 did not
+  find it; it now gets its old LUN back.
+- Without HOTPLUG: test program without error (as before).
+- Not run on NT 3.1-4.0 or 9x.
+
+Additions to 3.2.0.0 (2026-11-02): 4K=1, port program,
+GET_LOCATION
+
+- 4K=1 (Windows 2000, QEMU NVMe): a sparse 3 TB image; the disk shows
+  4096 bytes per sector and 3145727 MB. A test program wrote 64 KB
+  blocks, each carrying its own byte offset, at 0, 1 TB, 2 TB - 64 KB,
+  2 TB, 2.5 TB + 4 KB and the end, and read them back: all equal, and
+  each block found at its offset in the image file.
+- The queued read/write/verify test program (as for IDENT) on a 256 MB
+  namespace: no error, no mismatch.
+- Port program nvmecfg.exe on Windows 2000 (/t mode; the window was checked
+  with identcfg.exe, the same code):
+  controller found through HARDWARE\DEVICEMAP\Scsi, PCI location from
+  GET_LOCATION, devices from the inquiry data; an item turned off is
+  stored as OFF=<bus.dev.fn>:<item>. Not run on NT 3.1-4.0 or 9x/Me (no
+  test system with the driver here); it imports only functions those
+  systems have.
+- Build: MinGW-w64 GCC 13 as before; the 2000/XP x86 binary for the
+  Pentium (-march=i586, no CMOV), checked by disassembly; all binaries
+  link without libgcc (no 64-bit division helpers, whose calling
+  convention differs under -mrtd).
+
 Additions to 3.1.0.0 (2026-10-26): 32 namespaces, OFF=, MPS interrupt
 check, namespaces of 2 TB and more, 32 controllers
 
