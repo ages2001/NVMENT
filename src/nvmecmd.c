@@ -128,11 +128,23 @@ static BOOLEAN NvmeSubmitCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_QUEUE 
 
 BOOLEAN NvmeSubmitIoCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_COMMAND Cmd)
 {
+    PNVME_QUEUE queue = &DevExt->IoQueue, q;
     BOOLEAN result;
+    ULONG i;
 
-    result = NvmeSubmitCommand(DevExt, &DevExt->IoQueue, Cmd);
+    // Multi-queue: the queue with the fewest commands outstanding (the
+    // first on a tie, so a single request at a time stays on queue 1)
+    for (i = 1; i < DevExt->IoQueueCount; i++) {
+        q = NvmeIoQueue(DevExt, i);
+        if (q->Outstanding < queue->Outstanding) {
+            queue = q;
+        }
+    }
+
+    result = NvmeSubmitCommand(DevExt, queue, Cmd);
 
     if (result) {
+        queue->Outstanding++;
         NvmeArmWatchdog(DevExt);
 
         // Command successfully submitted - update queue depth tracking
@@ -203,7 +215,30 @@ BOOLEAN NvmeAdminSync(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_COMMAND Cmd, IN U
     return FALSE;
 }
 
-BOOLEAN NvmeCreateIoCQ(IN PHW_DEVICE_EXTENSION DevExt)
+//
+// NvmeResetIoQueues - software state of the I/O queues as after a controller
+// reset (doorbells 0, phase 1); Clear also zeroes the queue memory, so that
+// stale phase bits from an earlier run cannot look new
+//
+VOID NvmeResetIoQueues(IN PHW_DEVICE_EXTENSION DevExt, IN BOOLEAN Clear)
+{
+    ULONG i;
+
+    for (i = 0; i < DevExt->IoQueuesAllocated; i++) {
+        PNVME_QUEUE q = NvmeIoQueue(DevExt, i);
+        q->SubmissionQueueHead = 0;
+        q->SubmissionQueueTail = 0;
+        q->CompletionQueueHead = q->QueueSize;
+        q->CompletionQueueTail = 0;
+        q->Outstanding = 0;
+        if (Clear && q->SubmissionQueue != NULL && q->CompletionQueue != NULL) {
+            memset(q->SubmissionQueue, 0, q->QueueSize * NVME_SQ_ENTRY_SIZE);
+            memset(q->CompletionQueue, 0, q->QueueSize * NVME_CQ_ENTRY_SIZE);
+        }
+    }
+}
+
+static BOOLEAN NvmeCreateIoCQ(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_QUEUE Queue)
 {
     NVME_COMMAND cmd;
 
@@ -211,15 +246,15 @@ BOOLEAN NvmeCreateIoCQ(IN PHW_DEVICE_EXTENSION DevExt)
 
     cmd.CDW0.Fields.Opcode = NVME_ADMIN_CREATE_CQ;
     cmd.CDW0.Fields.Flags = 0;
-    cmd.CDW10 = ((DevExt->IoQueue.QueueSize - 1) << 16) | DevExt->IoQueue.QueueId;
+    cmd.CDW10 = ((ULONG)(Queue->QueueSize - 1) << 16) | Queue->QueueId;
     // CDW11: PC=1 (bit 0), IEN=1 (bit 1) to enable interrupts, IV=0 (bits 31:16)
     cmd.CDW11 = NVME_QUEUE_PHYS_CONTIG | NVME_QUEUE_IRQ_ENABLED | (0 << 16);
-    cmd.PRP1 = DevExt->IoQueue.CompletionQueuePhys.QuadPart;
+    cmd.PRP1 = Queue->CompletionQueuePhys.QuadPart;
 
     return NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS);
 }
 
-BOOLEAN NvmeCreateIoSQ(IN PHW_DEVICE_EXTENSION DevExt)
+static BOOLEAN NvmeCreateIoSQ(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_QUEUE Queue)
 {
     NVME_COMMAND cmd;
 
@@ -227,11 +262,401 @@ BOOLEAN NvmeCreateIoSQ(IN PHW_DEVICE_EXTENSION DevExt)
 
     cmd.CDW0.Fields.Opcode = NVME_ADMIN_CREATE_SQ;
     cmd.CDW0.Fields.Flags = 0;
-    cmd.CDW10 = ((DevExt->IoQueue.QueueSize - 1) << 16) | DevExt->IoQueue.QueueId;
-    cmd.CDW11 = NVME_QUEUE_PHYS_CONTIG | (DevExt->IoQueue.QueueId << 16);  // CQID
-    cmd.PRP1 = DevExt->IoQueue.SubmissionQueuePhys.QuadPart;
+    cmd.CDW10 = ((ULONG)(Queue->QueueSize - 1) << 16) | Queue->QueueId;
+    cmd.CDW11 = NVME_QUEUE_PHYS_CONTIG | ((ULONG)Queue->QueueId << 16);  // CQID
+    cmd.PRP1 = Queue->SubmissionQueuePhys.QuadPart;
 
     return NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS);
+}
+
+#ifdef NVMENT_W9X
+//
+// The BIOS's I/O queue (Windows 9x). A BIOS that serves the disk through
+// INT 13h leaves the controller enabled with its own I/O queue, queue ID 1.
+// When Windows 9x cannot match the disk to that BIOS drive (it reads the MBR
+// through INT 13h at startup, which some BIOSes fail), it keeps an MS-DOS
+// compatibility-mode drive for it, and the BIOS goes on using queue 1. After
+// our reset that queue would not exist: every BIOS call then waited for its
+// timeout (5 s in SeaBIOS, and DOS retries), so the drive letter hung. Queue 1
+// is set up again here, on the BIOS's own completion queue memory and at the
+// point the BIOS expects to continue, with a submission queue of ours in place
+// of the BIOS's: every entry in it is a READ of namespace 0, which the
+// controller fails at once (Invalid Namespace) without touching the medium.
+// A BIOS call so ends within a moment with an error, and the disk is only
+// reached through this driver, as it has to be (two drivers with a cache each
+// would not keep one volume intact).
+//
+// NvmeCaptureBiosQueue - before the reset: where the BIOS put its queue 1
+// and how large its two halves are. SeaBIOS keeps them in its struct
+// nvme_ctrl (pointer to the registers, doorbell stride, admin queues, I/O
+// queues), which lies in its high memory just above the admin submission
+// queue; it is recognised by the register address, the doorbell addresses
+// and the admin queue address it holds, and also tells where the BIOS
+// stands in its queue. Otherwise the Create I/O Completion/Submission Queue
+// commands still in the admin submission queue give the addresses.
+//
+// Field offsets in struct nvme_ctrl: reg, doorbell_stride, admin_sq.dbl,
+// admin_sq.sqe, admin_cq.dbl, io_sq.dbl, io_sq.mask, io_sq.cq, io_sq.tail,
+// io_cq (its start), io_cq.mask, io_cq.cqe, io_cq.head, io_cq phase byte,
+// size. SeaBIOS builds it packed (as found in 1.16.3); the natural layout
+// is the second line.
+enum { SB_REG, SB_STRIDE, SB_ASQ_DBL, SB_ASQ_SQE, SB_ACQ_DBL, SB_IOSQ_DBL, SB_IOSQ_MASK, SB_IOSQ_CQ,
+       SB_IOSQ_TAIL, SB_IOCQ, SB_IOCQ_MASK, SB_IOCQ_CQE, SB_IOCQ_HEAD, SB_IOCQ_PHASE, SB_SIZE,
+       SB_IOSQ_SQE, SB_IOSQ_HEAD, SB_FIELDS };
+static const UCHAR NvmeSbLayout[2][SB_FIELDS] = {
+    { 4, 8, 12, 18, 30, 47, 51, 57, 63, 65, 69, 71, 75, 77, 78, 53, 61 },
+    { 4, 8, 12, 20, 32, 52, 56, 64, 70, 72, 76, 80, 84, 86, 88, 60, 68 }
+};
+#define SB_U32(p, o)    (*(ULONG UNALIGNED *)((p) + (o)))
+#define SB_U16(p, o)    (*(USHORT UNALIGNED *)((p) + (o)))
+
+static PUCHAR NvmeFindSeaBiosCtrl(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Asq)
+{
+    PUCHAR area, p;
+    const UCHAR *o;
+    ULONG off, stride, db = DevExt->BarPhys + 0x1000, l;
+
+    // The page of the admin queue and the 32 KB above it (BIOS memory)
+    area = (PUCHAR)NvmeMapPhysToLinear(Asq, 0x9000, 0);
+    if (area == NULL || area == (PUCHAR)0xFFFFFFFF) {
+        return NULL;
+    }
+    for (l = 0; l < 2; l++) {
+        o = NvmeSbLayout[l];
+        for (off = 0; off + o[SB_SIZE] <= 0x9000; off++) {
+            p = area + off;
+            if (SB_U32(p, o[SB_REG]) != DevExt->BarPhys || SB_U32(p, o[SB_ASQ_DBL]) != db ||
+                SB_U32(p, o[SB_ASQ_SQE]) != Asq) {
+                continue;
+            }
+            stride = SB_U32(p, o[SB_STRIDE]);
+            if (stride < 4 || stride > 0x10000 || (stride & (stride - 1)) != 0) continue;
+            if (SB_U32(p, o[SB_ACQ_DBL]) != db + stride ||          // admin CQ head doorbell
+                SB_U32(p, o[SB_IOSQ_DBL]) != db + 2 * stride ||     // I/O SQ 1 tail doorbell
+                SB_U32(p, o[SB_IOCQ]) != db + 3 * stride ||         // I/O CQ 1 head doorbell
+                SB_U32(p, o[SB_IOSQ_CQ]) != Asq + off + o[SB_IOCQ]) {   // io_sq.cq = &io_cq
+                continue;
+            }
+            DevExt->BiosOff = o;
+            return p;
+        }
+    }
+    return NULL;
+}
+
+VOID NvmeCaptureBiosQueue(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    ULONG aqa, entries, i, cqBase = 0, cqSize = 0, sqSize = 0;
+    ULONGLONG asq;
+    PULONG sq, e;
+
+    DevExt->BiosCq = NULL;
+    DevExt->BiosCtrl = NULL;
+    DevExt->BiosSqBase = 0;
+    DevExt->BiosSqMem = NULL;
+    DevExt->BiosQueueOn = FALSE;
+    if (!(NvmeReadReg32(DevExt, NVME_REG_CC) & NVME_CC_ENABLE) ||
+        !(NvmeReadReg32(DevExt, NVME_REG_CSTS) & NVME_CSTS_RDY)) {
+        return;
+    }
+    aqa = NvmeReadReg32(DevExt, NVME_REG_AQA);
+    asq = NvmeReadReg64(DevExt, NVME_REG_ASQ);
+    entries = (aqa & 0xFFF) + 1;
+    if (asq == 0 || (asq >> 32) != 0 || (asq & 0xFFF) != 0) {
+        return;
+    }
+    DevExt->BiosCtrl = NvmeFindSeaBiosCtrl(DevExt, (ULONG)asq);
+    if (DevExt->BiosCtrl != NULL) {
+        cqBase = SB_U32(DevExt->BiosCtrl, DevExt->BiosOff[SB_IOCQ_CQE]);
+        cqSize = (ULONG)SB_U16(DevExt->BiosCtrl, DevExt->BiosOff[SB_IOCQ_MASK]) + 1;
+        sqSize = (ULONG)SB_U16(DevExt->BiosCtrl, DevExt->BiosOff[SB_IOSQ_MASK]) + 1;
+        DevExt->BiosSqBase = SB_U32(DevExt->BiosCtrl, DevExt->BiosOff[SB_IOSQ_SQE]);
+        entries = 0;
+    }
+    sq = entries ? (PULONG)NvmeMapPhysToLinear((ULONG)asq, entries * NVME_SQ_ENTRY_SIZE, 0) : NULL;
+    if (entries != 0 && (sq == NULL || sq == (PULONG)0xFFFFFFFF)) {
+        return;
+    }
+    for (i = 0; i < entries; i++) {
+        e = sq + i * (NVME_SQ_ENTRY_SIZE / 4);
+        // dword 0 opcode, 6-7 PRP1, 10 size and queue ID, 11 flags (and CQ ID)
+        if ((e[10] & 0xFFFF) != 1 || !(e[11] & NVME_QUEUE_PHYS_CONTIG)) {
+            continue;
+        }
+        if ((UCHAR)e[0] == NVME_ADMIN_CREATE_CQ && e[7] == 0) {
+            cqBase = e[6];
+            cqSize = (e[10] >> 16) + 1;
+        } else if ((UCHAR)e[0] == NVME_ADMIN_CREATE_SQ && (e[11] >> 16) == 1 && e[7] == 0) {
+            sqSize = (e[10] >> 16) + 1;
+            DevExt->BiosSqBase = e[6];
+        }
+    }
+    if (cqBase == 0 || (cqBase & 0xFFF) != 0 || cqSize < 2 || sqSize < 2 ||
+        sqSize > NVMENT_BIOS_SQ_PAGES * NVME_PAGE_SIZE / NVME_SQ_ENTRY_SIZE || cqSize > 4096) {
+        return;
+    }
+    DevExt->BiosCq = (PULONG)NvmeMapPhysToLinear(cqBase, cqSize * NVME_CQ_ENTRY_SIZE, 0);
+    if (DevExt->BiosCq == (PULONG)0xFFFFFFFF) {
+        DevExt->BiosCq = NULL;
+    }
+    DevExt->BiosCqPhys = cqBase;
+    DevExt->BiosCqSize = (USHORT)cqSize;
+    DevExt->BiosSqSize = (USHORT)sqSize;
+    if ((DevExt->BiosSqBase & 0xFFF) == 0 && DevExt->BiosSqBase != 0) {
+        DevExt->BiosSqMem = (PULONG)NvmeMapPhysToLinear(DevExt->BiosSqBase, sqSize * NVME_SQ_ENTRY_SIZE, 0);
+        if (DevExt->BiosSqMem == (PULONG)0xFFFFFFFF) {
+            DevExt->BiosSqMem = NULL;
+        }
+    }
+#ifdef NVMENT_DBG
+    ScsiDebugPrint(0, "NVMENT: BIOS I/O queue 1: CQ %08X x %u, SQ x %u\n", cqBase, cqSize, sqSize);
+#endif
+}
+
+//
+// NvmeBiosCqPhase - the phase bit of the BIOS completion queue's entry n
+//
+static ULONG NvmeBiosCqPhase(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG n)
+{
+    return (DevExt->BiosCq[n * 4 + 3] >> 16) & 1;
+}
+
+//
+// NvmeSetupBiosQueue - after our own queues: queue 1 as the BIOS left it, its
+// submission entries ours (they fail), advanced to where the BIOS stands
+//
+static VOID NvmeSetupBiosQueue(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    NVME_COMMAND cmd;
+    ULONG cqSize = DevExt->BiosCqSize, sqSize = DevExt->BiosSqSize;
+    ULONG first, h, phase, last, sqTail, sqHead, n, done, sqt, cqh, ph, i, m, k, wait;
+    BOOLEAN cqMade = FALSE;
+    PULONG sqMem;
+    ULONGLONG sqPhys;
+
+    if (DevExt->BiosCq == NULL || DevExt->BiosSq == NULL) {
+        return;
+    }
+    // Where the BIOS stands: the entries it has seen so far carry the phase of
+    // entry 0; the first one with the other phase is the next it waits for.
+    // Nothing outstanding, so the SQ head reported in the last completion is
+    // its submission queue tail.
+    if (DevExt->BiosCtrl != NULL) {
+        // SeaBIOS says it itself: io_cq.head, io_cq.phase, io_sq.tail
+        h = SB_U16(DevExt->BiosCtrl, DevExt->BiosOff[SB_IOCQ_HEAD]);
+        phase = DevExt->BiosCtrl[DevExt->BiosOff[SB_IOCQ_PHASE]] & 1;
+        sqTail = SB_U16(DevExt->BiosCtrl, DevExt->BiosOff[SB_IOSQ_TAIL]);
+        sqHead = SB_U16(DevExt->BiosCtrl, DevExt->BiosOff[SB_IOSQ_HEAD]);
+        if (h >= cqSize) {
+            return;
+        }
+    } else {
+        first = NvmeBiosCqPhase(DevExt, 0);
+        for (h = 1; h < cqSize; h++) {
+            if (NvmeBiosCqPhase(DevExt, h) != first) break;
+        }
+        if (h == cqSize) {
+            h = 0;
+            phase = first ^ 1;
+            last = cqSize - 1;
+        } else {
+            phase = first;
+            last = h - 1;
+        }
+        sqTail = DevExt->BiosCq[last * 4 + 2] & 0xFFFF;
+        if (phase == 1 && h == 0 && DevExt->BiosCq[last * 4 + 3] == 0) {
+            sqTail = 0;                             // the BIOS never completed a command
+        }
+        sqHead = sqTail;
+    }
+    if (sqTail >= sqSize) {
+        return;
+    }
+    // Completions to post from a new queue (tail 0, phase 1) so that the next
+    // one goes where the BIOS waits for it, with the phase it waits for. The
+    // BIOS's tail may be ahead of its head (commands it gave up on): the
+    // controller then also runs the entries in between at its next doorbell,
+    // and the BIOS takes the first of those completions; the gap stays the
+    // same from then on, every entry fails, and the BIOS does not look at
+    // the command identifier.
+    n = h + (phase ? 0 : cqSize);
+    if (((sqTail + sqSize - n % sqSize) % sqSize) >= cqSize - 1) {
+        return;                                     // the gap would fill the queue
+    }
+
+    // Which submission queue. With nothing outstanding at the BIOS, and its
+    // tail where the advance leaves the queue head, the BIOS's own one: its
+    // calls then work (through the BIOS, as Windows means a compatibility-mode
+    // drive to). Otherwise ours, where each entry fails at once. Either way the
+    // advance runs on entries of ours: a READ of namespace 0 in every entry
+    // (the BIOS writes each new command into its slot itself), the command
+    // identifier as the BIOS gives it (its tail).
+    if (DevExt->BiosSqMem != NULL && sqHead == sqTail && n % sqSize == sqTail) {
+        sqMem = DevExt->BiosSqMem;
+        sqPhys = DevExt->BiosSqBase;
+    } else {
+        sqMem = DevExt->BiosSq;
+        sqPhys = DevExt->BiosSqPhys.QuadPart;
+    }
+    memset(sqMem, 0, sqSize * NVME_SQ_ENTRY_SIZE);
+    for (i = 0; i < sqSize; i++) {
+        sqMem[i * (NVME_SQ_ENTRY_SIZE / 4)] = NVME_CMD_READ | (i << 16);
+    }
+
+    // The phase bits of the BIOS completion queue to 0: a new queue starts
+    // with phase 1, so an entry left over from an earlier setup (or from the
+    // BIOS) would look like one just posted. The BIOS waits at entry h for its
+    // phase; after the advance below that entry still does not carry it.
+    for (i = 0; i < cqSize; i++) {
+        DevExt->BiosCq[i * 4 + 3] &= ~0x00010000;
+    }
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.CDW0.Fields.Opcode = NVME_ADMIN_CREATE_CQ;
+    cmd.PRP1 = DevExt->BiosCqPhys;
+    cmd.CDW10 = ((cqSize - 1) << 16) | 1;
+    cmd.CDW11 = NVME_QUEUE_PHYS_CONTIG;             // no interrupt: the BIOS polls
+    if (!NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS)) {
+        return;
+    }
+    cqMade = TRUE;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.CDW0.Fields.Opcode = NVME_ADMIN_CREATE_SQ;
+    cmd.PRP1 = sqPhys;
+    cmd.CDW10 = ((sqSize - 1) << 16) | 1;
+    cmd.CDW11 = NVME_QUEUE_PHYS_CONTIG | (1 << 16);
+    if (!NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS)) {
+        goto fail;
+    }
+
+    // n failing commands, so that the controller's queue state is the BIOS's
+    done = 0; sqt = 0; cqh = 0; ph = 1;
+    while (done < n) {
+        m = n - done;
+        if (m > sqSize - 1) m = sqSize - 1;
+        if (m > cqSize - 1) m = cqSize - 1;
+        sqt = (sqt + m) % sqSize;
+        NvmeRingDoorbell(DevExt, 1, TRUE, (USHORT)sqt);
+        for (k = 0; k < m; k++) {
+            for (wait = 0; NvmeBiosCqPhase(DevExt, cqh) != ph; wait++) {
+                if (wait >= 100000) goto fail;      // 1 s
+                ScsiPortStallExecution(10);
+            }
+            if (++cqh == cqSize) {
+                cqh = 0;
+                ph ^= 1;
+            }
+        }
+        NvmeRingDoorbell(DevExt, 1, FALSE, (USHORT)cqh);
+        done += m;
+    }
+    DevExt->BiosQueueOn = TRUE;
+#ifdef NVMENT_DBG
+    ScsiDebugPrint(0, "NVMENT: BIOS queue 1 answering, head %u phase %u tail %u (%u steps)\n", h, phase, sqTail, n);
+#endif
+    return;
+
+fail:
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.CDW0.Fields.Opcode = NVME_ADMIN_DELETE_SQ;
+    cmd.CDW10 = 1;
+    NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS);
+    if (cqMade) {
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.CDW0.Fields.Opcode = NVME_ADMIN_DELETE_CQ;
+        cmd.CDW10 = 1;
+        NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS);
+    }
+}
+#endif
+
+//
+// NvmeCreateIoQueues - Set Features Number of Queues (07h) for the queue
+// pairs wanted, then a completion and a submission queue for each one the
+// controller allows. Queue 1 must be created; a further one that fails is
+// left out.
+//
+BOOLEAN NvmeCreateIoQueues(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    NVME_COMMAND cmd;
+    ULONG wanted = DevExt->IoQueuesAllocated, i;
+
+#ifdef NVMENT_W9X
+    // Windows 9x: the queues get IDs from 2 on, and queue ID 1 stays free. A BIOS
+    // that serves the disk through INT 13h set up queue 1 for itself. When Windows
+    // could not match the disk to that BIOS drive (its real-mode check reads the MBR
+    // through INT 13h), it keeps an MS-DOS compatibility-mode drive, and each access
+    // to it rings queue 1's doorbells. With queue 1 ours, the controller then ran
+    // stale entries of our queue and completed them to us (exception 0E in
+    // SCSIPORT.PDR); now the doorbell belongs to no queue, the controller ignores it
+    // and only the BIOS call fails.
+    {
+        ULONG ask = wanted + 1, base = 1;
+
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.CDW0.Fields.Opcode = NVME_ADMIN_SET_FEATURES;
+        cmd.CDW10 = NVME_FEAT_NUM_QUEUES;
+        cmd.CDW11 = ((ask - 1) << 16) | (ask - 1);
+        if (NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS)) {
+            ULONG nsqa = (DevExt->SyncDw0 & 0xFFFF) + 1, ncqa = (DevExt->SyncDw0 >> 16) + 1;
+            if (ask > nsqa) ask = nsqa;
+            if (ask > ncqa) ask = ncqa;
+        } else {
+            ask = 1;
+        }
+        if (ask >= 2) {
+            base = 2;
+            ask--;
+        }
+        if (wanted > ask) wanted = ask;
+        for (i = 0; i < DevExt->IoQueuesAllocated; i++) {
+            NvmeIoQueue(DevExt, i)->QueueId = (USHORT)(base + i);
+        }
+        DevExt->BiosQueueOn = FALSE;
+        if (base == 2) {
+            NvmeSetupBiosQueue(DevExt);
+        }
+    }
+#else
+    if (wanted > 1) {
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.CDW0.Fields.Opcode = NVME_ADMIN_SET_FEATURES;
+        cmd.CDW10 = NVME_FEAT_NUM_QUEUES;
+        cmd.CDW11 = ((wanted - 1) << 16) | (wanted - 1);
+        if (NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS)) {
+            // DW0: completion queues (31:16) and submission queues (15:0) allocated, 0-based
+            ULONG nsqa = (DevExt->SyncDw0 & 0xFFFF) + 1, ncqa = (DevExt->SyncDw0 >> 16) + 1;
+            if (wanted > nsqa) wanted = nsqa;
+            if (wanted > ncqa) wanted = ncqa;
+        } else {
+            wanted = 1;
+        }
+    }
+#endif
+
+    DevExt->IoQueueCount = 0;
+    DevExt->IoCapacity = 0;
+    for (i = 0; i < wanted; i++) {
+        PNVME_QUEUE q = NvmeIoQueue(DevExt, i);
+        if (!NvmeCreateIoCQ(DevExt, q)) {
+            break;
+        }
+        if (!NvmeCreateIoSQ(DevExt, q)) {
+            // The completion queue alone is of no use
+            memset(&cmd, 0, sizeof(cmd));
+            cmd.CDW0.Fields.Opcode = NVME_ADMIN_DELETE_CQ;
+            cmd.CDW10 = q->QueueId;
+            NvmeAdminSync(DevExt, &cmd, NVMENT_ADMIN_TIMEOUT_MS);
+            break;
+        }
+        DevExt->IoQueueCount++;
+        DevExt->IoCapacity += (ULONG)q->QueueSize - 1;
+    }
+#ifdef NVMENT_DBG
+    ScsiDebugPrint(0, "NVMENT: %u I/O queue pair(s) of %u entries (%u wanted)\n",
+                   DevExt->IoQueueCount, (ULONG)DevExt->IoQueue.QueueSize, DevExt->IoQueuesAllocated);
+#endif
+    return (BOOLEAN)(DevExt->IoQueueCount != 0);
 }
 
 //
@@ -1017,6 +1442,12 @@ VOID NvmeFreeSrbPages(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_SRB_EXTENSION Srb
         FreePrpListPage(DevExt, SrbExt->MetaPage);
         SrbExt->MetaPage = 0xFF;
     }
+#ifdef NVMENT_W9X
+    if (SrbExt->Bounced) {
+        DevExt->XBounceSrb = NULL;
+        SrbExt->Bounced = 0;
+    }
+#endif
 }
 
 //
@@ -1077,6 +1508,41 @@ PSCSI_REQUEST_BLOCK NvmeGetSrbFromCommandId(IN PHW_DEVICE_EXTENSION DevExt, IN U
 //
 // NvmeBuildReadWriteCommand - Build NVMe Read/Write command from SCSI CDB
 //
+//
+// NvmeAddBytes - a 64-bit byte count kept as two ULONGs
+//
+static VOID NvmeAddBytes(IN OUT PULONG Pair, IN ULONG Bytes)
+{
+    Pair[0] += Bytes;
+    if (Pair[0] < Bytes) {
+        Pair[1]++;
+    }
+}
+
+//
+// NvmeIsTrimPattern - the data is the TRIM pattern, repeated from the first
+// byte, over its whole length. Any length: a file system splits a write at
+// fragment boundaries, and TRIMNT's pattern repeats every 512 bytes, so
+// every piece still matches.
+//
+static BOOLEAN NvmeIsTrimPattern(IN PHW_DEVICE_EXTENSION DevExt, IN PUCHAR Data, IN ULONG Length)
+{
+    PUCHAR pattern = (PUCHAR)DevExt->TrimPattern;
+    ULONG i, j;
+
+    if (Data == NULL || pattern == NULL || Length == 0) {
+        return FALSE;
+    }
+    for (i = 0; i < Length; i += 4096) {
+        for (j = 0; j < 4096 && i + j < Length; j += 4) {
+            if (*(ULONG UNALIGNED *)(Data + i + j) != *(ULONG UNALIGNED *)(pattern + j)) {
+                return FALSE;
+            }
+        }
+    }
+    return TRUE;
+}
+
 int NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN PNVME_COMMAND Cmd, IN USHORT CommandId)
 {
     PNVME_LUN lun = &DevExt->Luns[NVME_LUN_INDEX(Srb)];
@@ -1102,6 +1568,7 @@ int NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_B
     // Initialize SRB extension
     srbExt = (PNVME_SRB_EXTENSION)Srb->SrbExtension;
     srbExt->PrpListPage = 0xFF;  // No PRP list initially
+    srbExt->Bounced = 0;
 
     ScsiGetLbaCount(Srb, &lba, &numBlocks, &isWrite, &fua);
 
@@ -1176,70 +1643,42 @@ int NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_B
     }
 #endif
 
-    // Check for TRIM mode: if writing and TRIM is enabled, compare first 4KB with pattern
-    if (isWrite && DevExt->TrimEnable && DevExt->TrimPattern != NULL && Srb->DataTransferLength >= 4096) {
-        // Compare first 4KB of DataBuffer with TrimPattern
-        if (memcmp(Srb->DataBuffer, DevExt->TrimPattern, 4096) == 0) {
-            // Match! Convert to TRIM/UNMAP (Dataset Management) command
-#ifdef NVMENT_DBG_EXTRA
-            ScsiDebugPrint(0, "NVMENT: TRIM pattern detected at LBA %08X%08X, blocks=%u - converting to DSM\n",
-                           (ULONG)(lba >> 32), (ULONG)(lba & 0xFFFFFFFF), numBlocks);
-#endif
-            // Build Dataset Management command
-            Cmd->CDW0.Fields.Opcode = NVME_CMD_DSM;
-            // Flags and CommandId already set, NSID already set
+    // TRIM mode: a write whose data is the pattern, repeated, over its whole
+    // length becomes a Dataset Management deallocate of its blocks. The
+    // range goes in a PRP list page; the caller's buffer is not touched.
+    // Without DSM the write goes to the medium and is counted.
+    if (isWrite && DevExt->TrimEnable && numBlocks != 0 &&
+        NvmeIsTrimPattern(DevExt, (PUCHAR)Srb->DataBuffer, numBlocks << lun->BlockShift)) {
+        if (DevExt->Oncs & NVME_ONCS_DSM) {
+            PULONG range;
+            UCHAR page = AllocatePrpListPage(DevExt);
 
-            // Clear reserved fields
+            if (page == 0xFF) {
+                lun->NonTaggedInFlight = NULL;
+                return 0;               // busy: retried
+            }
+            srbExt->PrpListPage = page;
+            range = (PULONG)GetPrpListPageVirtual(DevExt, page);
+            range[0] = 0;                                           // context attributes
+            range[1] = numBlocks << lun->LbaShift;                  // length in namespace blocks
+            range[2] = (ULONG)((lba << lun->LbaShift) & 0xFFFFFFFF);
+            range[3] = (ULONG)((lba << lun->LbaShift) >> 32);
+            Cmd->CDW0.Fields.Opcode = NVME_CMD_DSM;
             Cmd->CDW2 = 0;
             Cmd->CDW3 = 0;
             Cmd->MPTR = 0;
-
-            // DSM command format:
-            // CDW10: NR (Number of Ranges) - 1 range = 0
-            // CDW11: Attributes - bit 2 (AD) = deallocate
-            // PRP points to range data: [Context Attributes (32bit)][Length in blocks (32bit)][Starting LBA (64bit)]
-            Cmd->CDW10 = 0;  // 0 = 1 range
-            Cmd->CDW11 = (1 << 2);  // AD (Attribute - Deallocate)
+            Cmd->PRP1 = GetPrpListPagePhysical(DevExt, page).QuadPart;
+            Cmd->PRP2 = 0;
+            Cmd->CDW10 = 0;                                         // one range
+            Cmd->CDW11 = NVME_DSM_DEALLOCATE;
             Cmd->CDW12 = 0;
             Cmd->CDW13 = 0;
             Cmd->CDW14 = 0;
             Cmd->CDW15 = 0;
-
-            // Build range data structure in data buffer (reuse the buffer)
-            // Format: [Context Attributes: 32 bits][Length: 32 bits][SLBA: 64 bits]
-            {
-                PULONG rangeData = (PULONG)Srb->DataBuffer;
-                rangeData[0] = 0;  // Context attributes
-                rangeData[1] = numBlocks << lun->LbaShift;  // Length in namespace blocks
-                rangeData[2] = (ULONG)((lba << lun->LbaShift) & 0xFFFFFFFF);  // Starting LBA (low)
-                rangeData[3] = (ULONG)((lba << lun->LbaShift) >> 32);  // Starting LBA (high)
-#ifdef NVMENT_DBG_EXTRA
-                ScsiDebugPrint(0, "NVMENT: DSM range data - CtxAttr=0x%08X Len=%u SLBA=0x%08X%08X\n",
-                               rangeData[0], rangeData[1], rangeData[3], rangeData[2]);
-#endif
-            }
-
-            // Get physical address for the range data (only need 16 bytes)
-            length = 16;
-            physAddr = ScsiPortGetPhysicalAddress(DevExt, Srb, Srb->DataBuffer, &length);
-            if (physAddr.QuadPart == 0) {
-                DevExt->RejectedRequests++;
-                lun->NonTaggedInFlight = NULL;
-                ScsiError(DevExt, Srb, SRB_STATUS_INVALID_REQUEST);
-                return -1;
-            }
-
-            Cmd->PRP1 = physAddr.QuadPart;
-            Cmd->PRP2 = 0;
-
-#ifdef NVMENT_DBG_EXTRA
-            ScsiDebugPrint(0, "NVMENT: DSM command - CDW10=0x%08X CDW11=0x%08X PRP1=0x%08X%08X\n",
-                           Cmd->CDW10, Cmd->CDW11,
-                           (ULONG)(Cmd->PRP1 >> 32), (ULONG)(Cmd->PRP1 & 0xFFFFFFFF));
-#endif
-
+            NvmeAddBytes(DevExt->TrimmedBytes, numBlocks << lun->BlockShift);
             return 1;
         }
+        NvmeAddBytes(DevExt->TrimWrittenBytes, numBlocks << lun->BlockShift);
     }
 
     // Normal read/write: Set LBA and number of blocks
@@ -1276,6 +1715,35 @@ int NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_B
         ext->MetaPage = metaPage;
         Cmd->MPTR = GetPrpListPagePhysical(DevExt, metaPage).QuadPart;
     }
+
+#ifdef NVMENT_W9X
+    // A buffer that is not dword aligned goes through the bounce buffer:
+    // a PRP entry takes dword-aligned addresses only (NVMe 1.4, 4.3), and
+    // SCSIPORT.PDR does not keep to the AlignmentMask. One such request
+    // at a time; another one waits (busy, retried).
+    if (((ULONG_PTR)Srb->DataBuffer & 3) != 0 && DevExt->XBounce != NULL &&
+        Srb->DataTransferLength <= (NVMENT_XBOUNCE_PAGES << NVME_PAGE_SHIFT)) {
+        ULONG pages = (Srb->DataTransferLength + NVME_PAGE_SIZE - 1) >> NVME_PAGE_SHIFT;
+        if (DevExt->XBounceSrb != NULL) {
+            lun->NonTaggedInFlight = NULL;
+            return 0;
+        }
+        DevExt->XBounceSrb = Srb;
+        srbExt->Bounced = 1;
+        if (isWrite) {
+            memcpy(DevExt->XBounce, Srb->DataBuffer, Srb->DataTransferLength);
+        }
+        Cmd->PRP1 = DevExt->XBouncePage[0];
+        if (pages <= 1) {
+            Cmd->PRP2 = 0;
+        } else if (pages == 2) {
+            Cmd->PRP2 = DevExt->XBouncePage[1];
+        } else {
+            Cmd->PRP2 = DevExt->XBounceListPhys;
+        }
+        return 1;
+    }
+#endif
 
     // Normal read/write path - build PRPs
     // Get physical address of data buffer
@@ -1446,55 +1914,41 @@ VOID NvmeShutdownController(IN PHW_DEVICE_EXTENSION DevExt)
         goto cleanup_state;
     }
 
-    // Step 1: Delete I/O Submission Queue (must be deleted before CQ)
-    if (DevExt->InitComplete && DevExt->IoQueue.SubmissionQueue != NULL) {
-        NVME_COMMAND cmd;
+    // Steps 1 and 2: delete the I/O submission queues, then their
+    // completion queues (a CQ goes after the SQs that use it)
+    if (DevExt->InitComplete) {
+        ULONG pass, i;
 
-        memset(&cmd, 0, sizeof(NVME_COMMAND));
-        cmd.CDW0.Fields.Opcode = NVME_ADMIN_DELETE_SQ;
-        cmd.CDW0.Fields.CommandId = ADMIN_CID_SHUTDOWN_DELETE_SQ;
-        cmd.CDW10 = 1;  // QID = 1 (I/O queue)
+        for (pass = 0; pass < 2; pass++) {
+            for (i = DevExt->IoQueueCount; i-- > 0; ) {
+                PNVME_QUEUE q = NvmeIoQueue(DevExt, i);
+                NVME_COMMAND cmd;
 
-#ifdef NVMENT_DBG
-        ScsiDebugPrint(0, "NVMENT: Deleting I/O Submission Queue\n");
-#endif
-        NvmeSubmitAdminCommand(DevExt, &cmd);
-
-        // Poll for completion (simple polling, no interrupt)
-        timeoutMs = 1000; // 1 second timeout
-        elapsed = 0;
-        while (elapsed < timeoutMs) {
-            if (NvmeProcessAdminCompletion(DevExt)) {
-                break;
-            }
-            ScsiPortStallExecution(1000);  // 1 millisecond
-            elapsed++;
-        }
-    }
-
-    // Step 2: Delete I/O Completion Queue
-    if (DevExt->InitComplete && DevExt->IoQueue.CompletionQueue != NULL) {
-        NVME_COMMAND cmd;
-
-        memset(&cmd, 0, sizeof(NVME_COMMAND));
-        cmd.CDW0.Fields.Opcode = NVME_ADMIN_DELETE_CQ;
-        cmd.CDW0.Fields.CommandId = ADMIN_CID_SHUTDOWN_DELETE_CQ;
-        cmd.CDW10 = 1;  // QID = 1 (I/O queue)
+                if (q->SubmissionQueue == NULL || q->CompletionQueue == NULL) {
+                    continue;
+                }
+                memset(&cmd, 0, sizeof(NVME_COMMAND));
+                cmd.CDW0.Fields.Opcode = (UCHAR)(pass == 0 ? NVME_ADMIN_DELETE_SQ : NVME_ADMIN_DELETE_CQ);
+                cmd.CDW0.Fields.CommandId = (USHORT)(pass == 0 ? ADMIN_CID_SHUTDOWN_DELETE_SQ : ADMIN_CID_SHUTDOWN_DELETE_CQ);
+                cmd.CDW10 = q->QueueId;
 
 #ifdef NVMENT_DBG
-        ScsiDebugPrint(0, "NVMENT: Deleting I/O Completion Queue\n");
+                ScsiDebugPrint(0, "NVMENT: Deleting I/O %s Queue %u\n", pass == 0 ? "Submission" : "Completion",
+                               (ULONG)q->QueueId);
 #endif
-        NvmeSubmitAdminCommand(DevExt, &cmd);
+                NvmeSubmitAdminCommand(DevExt, &cmd);
 
-        // Poll for completion
-        timeoutMs = 1000; // 1 second timeout
-        elapsed = 0;
-        while (elapsed < timeoutMs) {
-            if (NvmeProcessAdminCompletion(DevExt)) {
-                break;
+                // Poll for completion (simple polling, no interrupt), 1 second at most
+                timeoutMs = 1000;
+                elapsed = 0;
+                while (elapsed < timeoutMs) {
+                    if (NvmeProcessAdminCompletion(DevExt)) {
+                        break;
+                    }
+                    ScsiPortStallExecution(1000);  // 1 millisecond
+                    elapsed++;
+                }
             }
-            ScsiPortStallExecution(1000); // 1 millisecond
-            elapsed++;
         }
     }
 
@@ -1578,12 +2032,8 @@ cleanup_state:
     DevExt->AdminQueue.CompletionQueueHead = DevExt->AdminQueue.QueueSize;
     DevExt->AdminQueue.CompletionQueueTail = 0;
 
-    // Reset I/O Queue state
-    DevExt->IoQueue.SubmissionQueueHead = 0;
-    DevExt->IoQueue.SubmissionQueueTail = 0;
-    // Reset CQ head to QueueSize to re-establish phase bit as 1 for next init
-    DevExt->IoQueue.CompletionQueueHead = DevExt->IoQueue.QueueSize;
-    DevExt->IoQueue.CompletionQueueTail = 0;
+    // Reset I/O queue state (CQ heads to QueueSize: phase 1 for the next init)
+    NvmeResetIoQueues(DevExt, FALSE);
 
     // Clear init state; the next request (or ScsiRestartAdapter / POWER_UP) sets it up again
     DevExt->InitComplete = FALSE;
@@ -1756,6 +2206,33 @@ static BOOLEAN NvmeAllocateQueues(IN PHW_DEVICE_EXTENSION DevExt)
                                 &DevExt->UtilityBufferPhys)) {
         return FALSE;
     }
+#ifdef NVMENT_W9X
+    // The bounce buffer for buffers that are not dword aligned: its pages
+    // (each with its own physical address) and a PRP list of pages 1..n
+    DevExt->XBounce = NULL;
+    DevExt->XBounceSrb = NULL;
+    if (!DevExt->DumpMode) {
+        PVOID listV, bounceV;
+        PHYSICAL_ADDRESS listP, bounceP;
+        if (AllocateUncachedMemory(DevExt, NVME_PAGE_SIZE, NVME_PAGE_SIZE, &listV, &listP) &&
+            AllocateUncachedMemory(DevExt, NVMENT_XBOUNCE_PAGES << NVME_PAGE_SHIFT, NVME_PAGE_SIZE,
+                                   &bounceV, &bounceP)) {
+            ULONG p, len;
+            BOOLEAN ok = TRUE;
+            DevExt->XBounceList = (PULONGLONG)listV;
+            DevExt->XBounceListPhys = listP.QuadPart;
+            for (p = 0; p < NVMENT_XBOUNCE_PAGES; p++) {
+                PHYSICAL_ADDRESS pa;
+                len = NVME_PAGE_SIZE;
+                pa = ScsiPortGetPhysicalAddress(DevExt, NULL, (PUCHAR)bounceV + (p << NVME_PAGE_SHIFT), &len);
+                if (pa.QuadPart == 0) ok = FALSE;
+                DevExt->XBouncePage[p] = pa.QuadPart;
+                if (p > 0) DevExt->XBounceList[p - 1] = pa.QuadPart;
+            }
+            if (ok) DevExt->XBounce = (PUCHAR)bounceV;
+        }
+    }
+#endif
     DevExt->PrpListPages = DevExt->UtilityBuffer;
     DevExt->PrpListPagesPhys = DevExt->UtilityBufferPhys;
     DevExt->PrpListPageBitmap = 0;  // All pages free
@@ -1783,6 +2260,40 @@ static BOOLEAN NvmeAllocateQueues(IN PHW_DEVICE_EXTENSION DevExt)
     // 6. TRIM pattern (optional, kept out of the device extension)
     if (AllocateUncachedMemory(DevExt, NVME_PAGE_SIZE, 4, &trimVirt, &trimPhys)) {
         DevExt->TrimPattern = (PULONG)trimVirt;
+    }
+
+#ifdef NVMENT_W9X
+    // The submission queue for the BIOS's queue ID 1 (NvmeSetupBiosQueue)
+    {
+        PVOID v;
+        DevExt->BiosSq = NULL;
+        if (AllocateUncachedMemory(DevExt, NVMENT_BIOS_SQ_PAGES * NVME_PAGE_SIZE, NVME_PAGE_SIZE, &v, &DevExt->BiosSqPhys)) {
+            DevExt->BiosSq = (PULONG)v;
+        }
+    }
+#endif
+
+    // 7. I/O queues 2..n (multi-queue), as far as the memory goes
+    DevExt->IoQueuesAllocated = 1;
+    while (DevExt->IoQueuesAllocated < DevExt->IoQueuesWanted && DevExt->IoQueuesAllocated < NVMENT_MAX_IO_QUEUES) {
+        PNVME_QUEUE q = NvmeIoQueue(DevExt, DevExt->IoQueuesAllocated);
+        PVOID sq, cq;
+        PHYSICAL_ADDRESS sqPhys, cqPhys;
+
+        if (!AllocateUncachedMemory(DevExt, queueSize * NVME_SQ_ENTRY_SIZE, NVME_PAGE_SIZE, &sq, &sqPhys) ||
+            !AllocateUncachedMemory(DevExt, queueSize * NVME_CQ_ENTRY_SIZE, NVME_PAGE_SIZE, &cq, &cqPhys)) {
+            break;
+        }
+        memset(q, 0, sizeof(NVME_QUEUE));
+        q->SubmissionQueue = sq;
+        q->SubmissionQueuePhys = sqPhys;
+        q->CompletionQueue = cq;
+        q->CompletionQueuePhys = cqPhys;
+        q->QueueSize = queueSize;
+        q->QueueId = (USHORT)(DevExt->IoQueuesAllocated + 1);
+        q->QueueSizeBits = (UCHAR)log2(queueSize);
+        q->QueueSizeMask = (USHORT)(queueSize - 1);
+        DevExt->IoQueuesAllocated++;
     }
 
     // Calculate log2(QueueSize) and mask for both queues (must be power of 2)
@@ -1814,16 +2325,11 @@ BOOLEAN NvmeStartController(IN PHW_DEVICE_EXTENSION DevExt)
     DevExt->AdminQueue.SubmissionQueueTail = 0;
     DevExt->AdminQueue.CompletionQueueHead = DevExt->AdminQueue.QueueSize;
     DevExt->AdminQueue.CompletionQueueTail = 0;
-    DevExt->IoQueue.SubmissionQueueHead = 0;
-    DevExt->IoQueue.SubmissionQueueTail = 0;
-    DevExt->IoQueue.CompletionQueueHead = DevExt->IoQueue.QueueSize;
-    DevExt->IoQueue.CompletionQueueTail = 0;
+    NvmeResetIoQueues(DevExt, TRUE);
 
     // Zero out queues: stale phase bits from an earlier run must not look new
     memset(DevExt->AdminQueue.SubmissionQueue, 0, DevExt->AdminQueue.QueueSize * NVME_SQ_ENTRY_SIZE);
     memset(DevExt->AdminQueue.CompletionQueue, 0, DevExt->AdminQueue.QueueSize * NVME_CQ_ENTRY_SIZE);
-    memset(DevExt->IoQueue.SubmissionQueue, 0, DevExt->IoQueue.QueueSize * NVME_SQ_ENTRY_SIZE);
-    memset(DevExt->IoQueue.CompletionQueue, 0, DevExt->IoQueue.QueueSize * NVME_CQ_ENTRY_SIZE);
 
     DevExt->PrpListPageBitmap = 0;
     DevExt->CurrentPrpListPagesUsed = 0;
@@ -1866,7 +2372,7 @@ BOOLEAN NvmeStartController(IN PHW_DEVICE_EXTENSION DevExt)
     // Interrupts stay masked (INTMS) while we poll; HwInitialize/NvmeReinitialize unmask
     NvmeWriteReg32(DevExt, NVME_REG_INTMS, 0xFFFFFFFF);
 
-    if (!NvmeCreateIoCQ(DevExt) || !NvmeCreateIoSQ(DevExt) ||
+    if (!NvmeCreateIoQueues(DevExt) ||
         !NvmeIdentifyController(DevExt) || !NvmeIdentifyNamespace(DevExt)) {
 #ifdef NVMENT_DBG
         ScsiDebugPrint(0, "NVMENT: NvmeStartController - init sequence failed\n");
@@ -2018,6 +2524,9 @@ BOOLEAN NvmeReinitialize(IN PHW_DEVICE_EXTENSION DevExt)
     if (DevExt->RequestsFlushed) {
         ScsiPortCompleteRequest(DevExt, 0, SP_UNTAGGED, SP_UNTAGGED, SRB_STATUS_BUS_RESET);
     }
+#ifdef NVMENT_W9X
+    DevExt->XBounceSrb = NULL;
+#endif
     DevExt->CurrentQueueDepth = 0;
     DevExt->InitComplete = FALSE;
 

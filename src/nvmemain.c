@@ -257,6 +257,69 @@ static VOID NvmeEnsurePnpInterface(IN PVOID RegistryPath)
 }
 #endif
 
+#ifdef NVMENT_W9X
+/* The Windows 9x loader does not clear the uninitialized data of a .MPD
+   (its RAM holds whatever was there): every global that has to start at
+   zero is cleared before anything reads it */
+static VOID
+NvmeZero9x(OUT PVOID Dst, IN ULONG Bytes)
+{
+    PUCHAR d = (PUCHAR)Dst;
+    while (Bytes--) *d++ = 0;
+}
+
+static VOID
+NvmeClearGlobals9x(VOID)
+{
+    NvmeZero9x(&g_Capacity16, sizeof(g_Capacity16));
+    NvmeZero9x(&g_Claimed, sizeof(g_Claimed));
+    NvmeZero9x(&g_ClaimedCount, sizeof(g_ClaimedCount));
+}
+#endif
+
+#if !defined(NVMENT_W9X)
+/* NT family: NotInboxDriver = 1 in the driver's own service key. IDENT
+   turns the in-box atdisk and atapi services off on NT 3.1-4.0; an
+   "atapi" service that is this driver copied over atapi.sys carries the
+   value, and IDENT leaves it alone. Declared here: miniport.h has no
+   registry API. */
+typedef struct { USHORT Length; USHORT MaximumLength; USHORT *Buffer; } NVMENT_MARK_STRING;
+typedef struct { ULONG Length; PVOID RootDirectory; NVMENT_MARK_STRING *ObjectName; ULONG Attributes;
+                 PVOID SecurityDescriptor; PVOID SecurityQualityOfService; } NVMENT_MARK_ATTRIBUTES;
+LONG __stdcall ZwOpenKey(PVOID *KeyHandle, ULONG DesiredAccess, PVOID ObjectAttributes);
+LONG __stdcall ZwSetValueKey(PVOID KeyHandle, PVOID ValueName, ULONG TitleIndex, ULONG Type,
+                             PVOID Data, ULONG DataSize);
+LONG __stdcall ZwClose(PVOID Handle);
+static USHORT g_NvmeNotInboxName[] = L"NotInboxDriver";
+
+static VOID
+NvmeMarkNotInbox(IN PVOID RegistryPath)
+{
+    NVMENT_MARK_ATTRIBUTES oa;
+    NVMENT_MARK_STRING name;
+    PVOID key;
+    ULONG one = 1;
+
+    if (RegistryPath == NULL) return;
+    oa.Length = sizeof(oa);
+    oa.RootDirectory = NULL;
+    oa.ObjectName = (NVMENT_MARK_STRING *)RegistryPath;
+#if (_WIN32_WINNT < 0x500)
+    oa.Attributes = 0x00000040;             /* OBJ_CASE_INSENSITIVE (NT 4.0 rejects OBJ_KERNEL_HANDLE) */
+#else
+    oa.Attributes = 0x00000240;             /* OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE */
+#endif
+    oa.SecurityDescriptor = NULL;
+    oa.SecurityQualityOfService = NULL;
+    if (ZwOpenKey(&key, 0x0002001F, &oa) < 0) return;  /* KEY_READ | KEY_WRITE */
+    name.Buffer = g_NvmeNotInboxName;
+    name.Length = (USHORT)(sizeof(g_NvmeNotInboxName) - sizeof(USHORT));
+    name.MaximumLength = (USHORT)sizeof(g_NvmeNotInboxName);
+    ZwSetValueKey(key, &name, 0, 4, &one, sizeof(one));    /* REG_DWORD */
+    ZwClose(key);
+}
+#endif
+
 //
 // DriverEntry - Main entry point
 //
@@ -265,15 +328,23 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     HW_INITIALIZATION_DATA hwInitData;
     ULONG status;
 #if (_WIN32_WINNT < 0x500)
-    ULONG HwContext[2];
+    ULONG HwContext[3];                     // bus, slot, controller behind an Intel VMD
 #endif
 
+#ifdef NVMENT_W9X
+    NvmeClearGlobals9x();
+#endif
     g_DumpMode = (BOOLEAN)(DriverObject == NULL);
 
 #ifdef NVMENT_DBG
     ScsiDebugPrint(0, "NVMENT: DriverEntry called%s\n", g_DumpMode ? " (dump)" : "");
 #endif
 
+#if !defined(NVMENT_W9X)
+    if (!g_DumpMode) {
+        NvmeMarkNotInbox(Argument2);
+    }
+#endif
 #if (_WIN32_WINNT >= 0x500)
     if (!g_DumpMode) {
         NvmeEnsurePnpInterface(Argument2);
@@ -349,6 +420,7 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 
     HwContext[0] = 0;
     HwContext[1] = 0;
+    HwContext[2] = 0;
 #endif
     // Call port driver
     status = ScsiPortInitialize(DriverObject, Argument2,
@@ -372,12 +444,16 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
         hwInitData.AdapterInterfaceType = Isa;
         HwContext[0] = 0;
         HwContext[1] = 0;
+        HwContext[2] = 0;
         status = ScsiPortInitialize(DriverObject, Argument2, &hwInitData, HwContext);
     }
 #endif
 
 #if (_WIN32_WINNT >= 0x500)
-    if (!g_DumpMode && status == 0) NvmeHookDeviceControl(DriverObject);
+    if (!g_DumpMode && status == 0) {
+        NvmeHookDeviceControl(DriverObject);
+        NvmeHookPnp(DriverObject);
+    }
 #endif
 #ifdef NVMENT_DBG
     ScsiDebugPrint(0, "NVMENT: DriverEntry exiting with status 0x%08X\n", status);
@@ -453,6 +529,10 @@ ULONG HwFoundAdapter(
         if (ArgPresent(ArgumentString, "IRQ=0")) {
             interruptPin = 0;
         }
+        // behind an Intel VMD: no INTx (nvmevmd.c)
+        if (DevExt->VmdChildCfg != NULL || DevExt->RemapNoConfig) {
+            interruptPin = 0;
+        }
         if (interruptPin != 0 && interruptLine != 0 && interruptLine != 0xFF) {
             ConfigInfo->BusInterruptLevel = interruptLine;
             ConfigInfo->BusInterruptVector = interruptLine;
@@ -517,8 +597,19 @@ ULONG HwFoundAdapter(
 #endif
     DevExt->HpNamespaces = (BOOLEAN)(DevExt->HotPlug && ArgPresent(ArgumentString, "HOTPLUG=1"));
     DevExt->AdminAll = (BOOLEAN)ArgPresent(ArgumentString, "ADMIN=1");
+    // I/O queue pairs: QUEUES=n (1-4); four on the NT family, one on 9x
+    // (one request at a time there) and in the dump stack
+#ifdef NVMENT_W9X
+    DevExt->IoQueuesWanted = ArgDecimal(ArgumentString, "QUEUES=", 1);
+#else
+    DevExt->IoQueuesWanted = ArgDecimal(ArgumentString, "QUEUES=", NVMENT_MAX_IO_QUEUES);
+#endif
+    if (DevExt->IoQueuesWanted < 1) DevExt->IoQueuesWanted = 1;
+    if (DevExt->IoQueuesWanted > NVMENT_MAX_IO_QUEUES) DevExt->IoQueuesWanted = NVMENT_MAX_IO_QUEUES;
+    if (DevExt->DumpMode) DevExt->IoQueuesWanted = 1;
     ParseNamespacesOff(DevExt, ArgumentString);
     DevExt->PollMode = (BOOLEAN)(DevExt->DumpMode || ArgPresent(ArgumentString, "IRQ=0") ||
+                                 DevExt->VmdChildCfg != NULL || DevExt->RemapNoConfig ||
                                  (ConfigInfo->BusInterruptLevel == 0 && ConfigInfo->BusInterruptVector == 0));
 
     // Set the number of access ranges we're using (1 for BAR0)
@@ -639,6 +730,7 @@ ULONG HwFoundAdapter(
     (VOID)mapBus;
     DevExt->ControllerRegisters = NvmeMapPhysToLinear(accessRange->RangeStart.LowPart,
                                                       accessRange->RangeLength, 0);
+    DevExt->BarPhys = accessRange->RangeStart.LowPart;
     if (DevExt->ControllerRegisters == (PVOID)0xFFFFFFFF) {
         DevExt->ControllerRegisters = NULL;
     }
@@ -705,10 +797,16 @@ ULONG HwFoundAdapter(
 #endif
 
     // Allocate uncached memory block:
-    // queues (4 pages), PRP list pool / utility buffer, TRIM pattern, alignment
+    // queues (4 pages), PRP list pool / utility buffer, TRIM pattern, alignment,
+    // two pages for each further I/O queue pair
     // The dump stack has little memory and does one request at a time.
     DevExt->SgListPages = DevExt->DumpMode ? 4 : 32;
-    DevExt->UncachedExtensionSize = (NVME_PAGE_SIZE * (DevExt->SgListPages + 4 + 1 + 1));
+    DevExt->UncachedExtensionSize = (NVME_PAGE_SIZE * (DevExt->SgListPages + 4 + 1 + 1 +
+                                                       2 * (DevExt->IoQueuesWanted - 1) + NVMENT_BIOS_SQ_PAGES));
+#ifdef NVMENT_W9X
+    // the bounce buffer for buffers that are not dword aligned, and its PRP list
+    if (!DevExt->DumpMode) DevExt->UncachedExtensionSize += NVME_PAGE_SIZE * (NVMENT_XBOUNCE_PAGES + 1);
+#endif
 
     DevExt->UncachedExtensionBase = ScsiPortGetUncachedExtension(
         (PVOID)DevExt,
@@ -717,7 +815,8 @@ ULONG HwFoundAdapter(
 
     if (DevExt->UncachedExtensionBase == NULL) {
         DevExt->SgListPages = DevExt->DumpMode ? 2 : 16;
-        DevExt->UncachedExtensionSize = (NVME_PAGE_SIZE * (DevExt->SgListPages + 4 + 1 + 1));
+        DevExt->IoQueuesWanted = 1;
+        DevExt->UncachedExtensionSize = (NVME_PAGE_SIZE * (DevExt->SgListPages + 4 + 1 + 1 + NVMENT_BIOS_SQ_PAGES));
 
         DevExt->UncachedExtensionBase = ScsiPortGetUncachedExtension(
             (PVOID)DevExt,
@@ -757,6 +856,9 @@ ULONG HwFoundAdapter(
     ScsiDebugPrint(0, "NVMENT: HwFoundAdapter - success, returning SP_RETURN_FOUND\n");
 #endif
 
+#ifdef NVMENT_W9X
+    NvmeCaptureBiosQueue(DevExt);
+#endif
     if (!NvmeSanitizeController(DevExt)) {
 #ifdef NVMENT_DBG
         ScsiDebugPrint(0, "NVMENT: HwInHwFoundAdapteritialize - NvmeSanitizeController failed\n");
@@ -826,6 +928,18 @@ ULONG HwFindAdapter(
     busNumber = ConfigInfo->SystemIoBusNumber;
     slotNumber = ConfigInfo->SlotNumber;
     bytesRead = GetPciConfig(DevExt, busNumber, slotNumber, pciBuffer, 256);
+    // an Intel VMD: its first NVMe controller (nvmevmd.c)
+    if (bytesRead != 0 && !NvmeIsClaimed(busNumber, slotNumber) && NvmeIsVmd((PUCHAR)pciBuffer) &&
+        !ArgPresent(ArgumentString, "VMD=0")) {
+        DevExt->BusNumber = busNumber;
+        DevExt->SlotNumber = slotNumber;
+        ConfigInfo->AdapterInterfaceType = PCIBus;
+        if (!NvmeVmdAttach(DevExt, ConfigInfo, busNumber, slotNumber, (PUCHAR)pciBuffer, 0)) {
+            return SP_RETURN_NOT_FOUND;
+        }
+        NvmeClaim(busNumber, slotNumber);
+        return HwFoundAdapter(DevExt, ConfigInfo, (PUCHAR)pciBuffer, ArgumentString, TRUE);
+    }
     if (bytesRead == 0 || NvmeIsClaimed(busNumber, slotNumber) ||
         !IsNvmeDevice(((PUCHAR)pciBuffer)[PCI_CLASS_CODE_OFFSET + 2], ((PUCHAR)pciBuffer)[PCI_CLASS_CODE_OFFSET + 1],
                       ((PUCHAR)pciBuffer)[PCI_CLASS_CODE_OFFSET])) {
@@ -910,14 +1024,36 @@ ULONG HwFindAdapter(
                        baseClass, subClass, progIf);
 #endif
 
-        if (!IsNvmeDevice(baseClass, subClass, progIf)) {
-            *Again = FALSE;
-            return SP_RETURN_NOT_FOUND;
-        }
-
         DevExt->BusNumber = busNumber;
         DevExt->SlotNumber = slotNumber;
         *Again = FALSE;
+
+        // An Intel VMD: its first NVMe controller (nvmevmd.c)
+        if (NvmeIsVmd((PUCHAR)pciBuffer) && !ArgPresent(ArgumentString, "VMD=0")) {
+            ConfigInfo->AdapterInterfaceType = PCIBus;
+            ConfigInfo->SystemIoBusNumber = busNumber;
+            ConfigInfo->SlotNumber = slotNumber;
+            if (!NvmeVmdAttach(DevExt, ConfigInfo, busNumber, slotNumber, (PUCHAR)pciBuffer, 0)) {
+                return SP_RETURN_NOT_FOUND;
+            }
+            return HwFoundAdapter(DevExt, ConfigInfo, (PUCHAR)pciBuffer, ArgumentString, TRUE);
+        }
+
+        // The Intel AHCI/RAID function itself, given to NVMENT: its first
+        // RST remapped NVMe controller (nvmevmd.c)
+        if (NvmeIsRemapHost((PUCHAR)pciBuffer) && !ArgPresent(ArgumentString, "REMAP=0")) {
+            ConfigInfo->AdapterInterfaceType = PCIBus;
+            ConfigInfo->SystemIoBusNumber = busNumber;
+            ConfigInfo->SlotNumber = slotNumber;
+            if (!NvmeRemapAttach(DevExt, ConfigInfo, busNumber, slotNumber, (PUCHAR)pciBuffer, 0)) {
+                return SP_RETURN_NOT_FOUND;
+            }
+            return HwFoundAdapter(DevExt, ConfigInfo, (PUCHAR)pciBuffer, ArgumentString, TRUE);
+        }
+
+        if (!IsNvmeDevice(baseClass, subClass, progIf)) {
+            return SP_RETURN_NOT_FOUND;
+        }
         
         // Ensure ConfigInfo matches the adapter we found (needed for non-PnP/textmode/NT4 scan paths)
         ConfigInfo->AdapterInterfaceType = PCIBus;
@@ -967,6 +1103,59 @@ scanloop:
                    busNumber, slotNumber, DevExt->VendorId, DevExt->DeviceId,
                    baseClass, subClass, progIf);
 #endif
+
+    // An Intel VMD: its NVMe controllers one by one, HwContext[2] the next
+    // (nvmevmd.c)
+    if (NvmeIsVmd((PUCHAR)pciBuffer) && !ArgPresent(ArgumentString, "VMD=0")) {
+        ULONG child = HwContext ? ((PULONG)HwContext)[2] : 0;
+        DevExt->BusNumber = busNumber;
+        DevExt->SlotNumber = slotNumber;
+        if (hasSlot) {
+            ConfigInfo->AdapterInterfaceType = PCIBus;
+            ConfigInfo->SystemIoBusNumber = busNumber;
+            ConfigInfo->SlotNumber = slotNumber;
+        }
+        if (child < NVMENT_VMD_MAX_CHILDREN &&
+            NvmeVmdAttach(DevExt, ConfigInfo, busNumber, slotNumber, (PUCHAR)pciBuffer, child)) {
+            if (HwContext) {
+                ((PULONG)HwContext)[0] = busNumber;
+                ((PULONG)HwContext)[1] = slotNumber;
+                ((PULONG)HwContext)[2] = child + 1;
+                *Again = TRUE;
+            } else {
+                *Again = FALSE;
+            }
+            return HwFoundAdapter(DevExt, ConfigInfo, (PUCHAR)pciBuffer, ArgumentString, hasSlot);
+        }
+        DevExt->VmdChildCfg = NULL;
+        if (HwContext) ((PULONG)HwContext)[2] = 0;
+        goto scannext;
+    }
+
+    // An Intel AHCI/RAID function with RST remapped NVMe controllers: those
+    // one by one, HwContext[2] the next (nvmevmd.c)
+    if (NvmeIsRemapHost((PUCHAR)pciBuffer) && !ArgPresent(ArgumentString, "REMAP=0")) {
+        ULONG child = HwContext ? ((PULONG)HwContext)[2] : 0;
+        if (hasSlot) {
+            ConfigInfo->AdapterInterfaceType = PCIBus;
+            ConfigInfo->SystemIoBusNumber = busNumber;
+            ConfigInfo->SlotNumber = slotNumber;
+        }
+        if (NvmeRemapAttach(DevExt, ConfigInfo, busNumber, slotNumber, (PUCHAR)pciBuffer, child)) {
+            if (HwContext) {
+                ((PULONG)HwContext)[0] = busNumber;
+                ((PULONG)HwContext)[1] = slotNumber;
+                ((PULONG)HwContext)[2] = child + 1;
+                *Again = TRUE;
+            } else {
+                *Again = FALSE;
+            }
+            return HwFoundAdapter(DevExt, ConfigInfo, (PUCHAR)pciBuffer, ArgumentString, hasSlot);
+        }
+        DevExt->RemapNoConfig = FALSE;
+        if (HwContext) ((PULONG)HwContext)[2] = 0;
+        goto scannext;
+    }
 
     // Check if this is an NVMe device
     if (IsNvmeDevice(baseClass, subClass, progIf)) {
@@ -1074,6 +1263,7 @@ BOOLEAN HwStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
     if (Srb->SrbExtension != NULL) {
         ((PNVME_SRB_EXTENSION)Srb->SrbExtension)->PrpListPage = 0xFF;
         ((PNVME_SRB_EXTENSION)Srb->SrbExtension)->MetaPage = 0xFF;
+        ((PNVME_SRB_EXTENSION)Srb->SrbExtension)->Bounced = 0;
     }
 
     // "NVMENT" IOCTLs (info, power down/up) do not wake the controller up
@@ -1390,6 +1580,9 @@ static VOID NvmeHotPlugCheck(IN PHW_DEVICE_EXTENSION DevExt)
         ScsiDebugPrint(0, "NVMENT: controller gone (CSTS=FFFFFFFF)\n");
 #endif
         ScsiPortCompleteRequest(DevExt, 0, SP_UNTAGGED, SP_UNTAGGED, SRB_STATUS_SELECTION_TIMEOUT);
+#ifdef NVMENT_W9X
+        DevExt->XBounceSrb = NULL;
+#endif
         for (l = 0; l < NVMENT_MAX_LUNS; l++) {
             DevExt->Luns[l].NonTaggedInFlight = NULL;
         }
@@ -1561,6 +1754,11 @@ BOOLEAN HwInterrupt(IN PVOID DeviceExtension)
     if (!DevExt->ResourcesAllocated || DevExt->Stopped) {
         return FALSE;
     }
+    // Behind a VMD (Fast Polling): the interrupt is a dormant or borrowed
+    // line (nvmepdo.c), never the controller's
+    if (DevExt->VmdChildCfg != NULL) {
+        return FALSE;
+    }
 
     // Process Admin Queue completions first
     if (NvmeProcessAdminCompletion(DevExt)) {
@@ -1603,6 +1801,9 @@ BOOLEAN HwResetBus(IN PVOID DeviceExtension, IN ULONG PathId)
     ScsiPortCompleteRequest(DeviceExtension, (UCHAR)PathId, 
                            SP_UNTAGGED, SP_UNTAGGED,
                            SRB_STATUS_BUS_RESET);
+#ifdef NVMENT_W9X
+    ((PHW_DEVICE_EXTENSION)DeviceExtension)->XBounceSrb = NULL;
+#endif
 
     return TRUE;
 }
@@ -1649,7 +1850,8 @@ SCSI_ADAPTER_CONTROL_STATUS HwAdapterControl(
             ScsiDebugPrint(0, "NVMENT: ScsiRestartAdapter - reinitializing\n");
 #endif
             // Controller was shut down (and maybe powered off): set it up again
-            if (NvmeReinitialize(DevExt)) {
+            // (behind an Intel VMD: the domain first)
+            if (NvmeVmdRestore(DevExt) && NvmeReinitialize(DevExt)) {
                 status = ScsiAdapterControlSuccess;
             } else {
                 status = ScsiAdapterControlUnsuccessful;

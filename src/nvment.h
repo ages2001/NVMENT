@@ -23,6 +23,7 @@ VOID  ScsiPortWriteRegisterUlong(PULONG Register, ULONG Value);
 #include <ntdddisk.h>
 #include "nvme.h"
 #include "scsiext.h"
+#include "vmdcore.h"
 
 //#define NVMENT_DBG
 // extra spammy logging for NVMe commands
@@ -125,6 +126,14 @@ PVOID __cdecl NvmeMapPhysToLinear(ULONG PhysAddr, ULONG nBytes, ULONG Flags);
 #define NVME_LUN_INDEX(srb)             ((ULONG)(srb)->TargetId * NVMENT_LUNS_PER_TARGET + (srb)->Lun)
 #define NVMENT_INFO_LUNS                8                   // NVMENT_INFO keeps its layout
 #define NVMENT_MAX_SG_PAGES             32      // PRP list page pool
+//
+// I/O queue pairs: up to NVMENT_MAX_IO_QUEUES (QID 1..n, a page each for
+// the submission and the completion queue), all on interrupt vector 0
+// (ScsiPort connects one interrupt). A command goes to the queue with the
+// fewest commands outstanding. QUEUES=n (1-4) sets the number; the dump
+// stack uses one.
+//
+#define NVMENT_MAX_IO_QUEUES            4
 #define NVMENT_MAX_CONTROLLERS          32
 
 //
@@ -173,7 +182,7 @@ typedef struct _NVME_QUEUE {
     USHORT QueueSize;
     UCHAR QueueSizeBits;         // log2(QueueSize), for phase calculation
     UCHAR Reserved;              // Padding for alignment
-    ULONG reserved1;
+    ULONG Outstanding;           // I/O queue: commands submitted and not yet completed
     ULONG reserved2;
 } NVME_QUEUE, *PNVME_QUEUE;
 
@@ -194,10 +203,13 @@ typedef struct _NVME_QUEUE {
 //
 // SRB Extension - per-request data stored by ScsiPort
 //
+#define NVMENT_XBOUNCE_PAGES    32      // 128 KB, the largest 9x transfer
+
 typedef struct _NVME_SRB_EXTENSION {
     UCHAR PrpListPage;              // Which PRP list page is allocated (0xFF if none)
     UCHAR MetaPage;                 // page holding the metadata of a namespace with MS != 0 (0xFF if none)
-    UCHAR Reserved[2];              // Padding for alignment
+    UCHAR Bounced;                  // data through DevExt->XBounce (9x)
+    UCHAR Reserved;
 } NVME_SRB_EXTENSION, *PNVME_SRB_EXTENSION;
 
 //
@@ -243,6 +255,7 @@ typedef struct _NVME_LUN {
 #define NVMENT_IOCTL_TRIM_MODE_ON     0x1001
 #define NVMENT_IOCTL_TRIM_MODE_OFF    0x1002
 #define NVMENT_IOCTL_GET_LOCATION     0x1003  // ULONG: bus << 16 | device << 8 | function
+#define NVMENT_IOCTL_TRIM_STATUS      0x1004  // NVMENT_TRIM_STATUS after the header
 #define NVMENT_IOCTL_POWER_DOWN       0x1010  // shutdown notification; the next request or POWER_UP brings it back
 #define NVMENT_IOCTL_POWER_UP         0x1011
 
@@ -252,6 +265,26 @@ typedef struct _NVME_LUN {
 #define NVMENT_INFO_TRIM_MODE           0x00000008  // writes of the TRIM pattern become deallocates
 #define NVMENT_INFO_APST                0x00000010  // autonomous power state transitions on
 #define NVMENT_INFO_HMB                 0x00000020  // host memory buffer given to the controller
+
+//
+// TRIM_STATUS: in the address of a namespace, out whether its pattern
+// writes become deallocates and the adapter's byte counts since TRIM_MODE_ON
+//
+typedef struct _NVMENT_TRIM_STATUS {
+    UCHAR PathId;
+    UCHAR TargetId;
+    UCHAR Lun;
+    UCHAR Flags;                        // NVMENT_TRIM_STATUS_xxx
+    ULONG BlockSize;                    // bytes per logical block of the disk
+    ULONG TrimmedLow;                   // pattern writes deallocated
+    ULONG TrimmedHigh;
+    ULONG WrittenLow;                   // pattern writes the medium got as data
+    ULONG WrittenHigh;
+} NVMENT_TRIM_STATUS, *PNVMENT_TRIM_STATUS;
+
+#define NVMENT_TRIM_STATUS_PRESENT      0x01    // a namespace at that address
+#define NVMENT_TRIM_STATUS_CAN_TRIM     0x02    // its pattern writes become deallocates
+#define NVMENT_TRIM_STATUS_MODE_ON      0x04
 
 typedef struct _NVMENT_INFO {
     ULONG Version;                                  // NVMENT_DRIVER_VERSION
@@ -265,9 +298,16 @@ typedef struct _NVMENT_INFO {
     ULONG NamespaceId[NVMENT_INFO_LUNS];            // the first eight
     ULONG BlockSize[NVMENT_INFO_LUNS];
     ULONGLONG SizeInBlocks[NVMENT_INFO_LUNS];
+    // 3.3: only when the buffer has room for them
+    ULONG IoQueues;                                 // I/O queue pairs in use
+    ULONG IoQueueEntries;                           // entries per queue
 } NVMENT_INFO, *PNVMENT_INFO;
+#define NVMENT_INFO_SIZE_V1             ((ULONG)FIELD_OFFSET(NVMENT_INFO, IoQueues))
 
-#define NVMENT_DRIVER_VERSION   0x03020000  // 3.2.0.0
+#define NVMENT_DRIVER_VERSION   0x03030000  // 3.3
+
+// Intel VMD: NVMe controllers taken per VMD
+#define NVMENT_VMD_MAX_CHILDREN         8
 
 //
 // Device extension structure - stores per-adapter data
@@ -298,7 +338,7 @@ typedef struct _HW_DEVICE_EXTENSION {
     // Admin Queue
     NVME_QUEUE AdminQueue;                          // Offset 0x40 (64) - 56 bytes [8-byte aligned]
 
-    // I/O Queue (single queue for simplicity)
+    // I/O queue 1 (the further ones in IoQueueMore, NvmeIoQueue(DevExt, i))
     NVME_QUEUE IoQueue;                             // Offset 0x78 (120) - 56 bytes [8-byte aligned]
 
     // Command tracking
@@ -362,6 +402,8 @@ typedef struct _HW_DEVICE_EXTENSION {
     BOOLEAN TrimEnable;
     UCHAR Reserved5[3];
     PULONG TrimPattern;                             // 4KB pattern buffer (uncached extension)
+    ULONG TrimmedBytes[2];                          // since TRIM_MODE_ON: low, high
+    ULONG TrimWrittenBytes[2];
 
     // Namespaces (LUN n = Luns[n])
     NVME_LUN Luns[NVMENT_MAX_LUNS];
@@ -435,7 +477,68 @@ typedef struct _HW_DEVICE_EXTENSION {
     ULONG ReportedTransfer;                         // the MaximumTransferLength ScsiPort was given
     ULONG NsOffCount;                               // OFF=: namespaces left out
     ULONG NsOff[16];
+
+    // I/O queues 2..n (multi-queue)
+    NVME_QUEUE IoQueueMore[NVMENT_MAX_IO_QUEUES - 1];
+    ULONG IoQueuesWanted;                           // QUEUES=n, or the default
+    ULONG IoQueuesAllocated;                        // queue pairs with memory
+    ULONG IoQueueCount;                             // created on the controller
+    ULONG IoCapacity;                               // commands all of them hold
+#ifdef NVMENT_W9X
+    // The BIOS's own I/O queue (queue ID 1), kept answering on Windows 9x:
+    // see NvmeCaptureBiosQueue
+    ULONG BarPhys;                                  // BAR0, physical
+    PUCHAR BiosCtrl;                                // SeaBIOS's struct nvme_ctrl, when found
+    const UCHAR *BiosOff;                           // its field offsets (packed or not)
+    PULONG BiosCq;                                  // its completion queue (BIOS memory)
+    ULONG BiosCqPhys;
+    USHORT BiosCqSize;
+    USHORT BiosSqSize;
+    PULONG BiosSq;                                  // the submission queue in its place (ours)
+    ULONG BiosSqBase;                               // the BIOS's own submission queue
+    PULONG BiosSqMem;
+    PHYSICAL_ADDRESS BiosSqPhys;
+    BOOLEAN BiosQueueOn;
+    // Bounce buffer for data buffers that are not dword aligned (a PRP
+    // entry takes dword-aligned addresses only): SCSIPORT.PDR passes them
+    // on whatever the AlignmentMask. One request at a time.
+    PUCHAR XBounce;
+    ULONGLONG XBouncePage[NVMENT_XBOUNCE_PAGES];
+    PULONGLONG XBounceList;
+    ULONGLONG XBounceListPhys;
+    PSCSI_REQUEST_BLOCK XBounceSrb;
+#endif
+    // Intel VMD: the controller sits in the VMD's own PCI domain (see
+    // nvmevmd.c); its configuration space is reached through the VMD's
+    // CFGBAR
+    PUCHAR VmdChildCfg;                             // the controller's configuration space, NULL: not behind a VMD
+    ULONG VmdBus;                                   // the VMD function
+    ULONG VmdSlot;
+    ULONG VmdChild;                                 // index among the VMD's NVMe controllers
+    INTERFACE_TYPE VmdMapType;                      // how the CFGBAR is mapped
+    ULONG VmdMapBus;
+    VMD_DOMAIN Vmd;
+    BOOLEAN RemapNoConfig;                          // Intel RST remapped NVMe: no configuration space of its own
 } HW_DEVICE_EXTENSION, *PHW_DEVICE_EXTENSION;
+
+// nvmevmd.c
+BOOLEAN NvmeIsVmd(IN PUCHAR PciConfig);
+BOOLEAN NvmeVmdAttach(IN PHW_DEVICE_EXTENSION DevExt, IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo,
+                      IN ULONG Bus, IN ULONG Slot, IN PUCHAR VmdConfig, IN ULONG Child);
+BOOLEAN NvmeVmdRestore(IN PHW_DEVICE_EXTENSION DevExt);
+BOOLEAN NvmeIsRemapHost(IN PUCHAR PciConfig);
+BOOLEAN NvmeRemapAttach(IN PHW_DEVICE_EXTENSION DevExt, IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo,
+                        IN ULONG Bus, IN ULONG Slot, IN PUCHAR PciConfig, IN ULONG Child);
+
+// Windows 9x: pages for the submission queue that takes the BIOS's place
+// (up to 256 entries)
+#ifdef NVMENT_W9X
+#define NVMENT_BIOS_SQ_PAGES    4
+#else
+#define NVMENT_BIOS_SQ_PAGES    0
+#endif
+
+#define NvmeIoQueue(DevExt, i)  ((i) == 0 ? &(DevExt)->IoQueue : &(DevExt)->IoQueueMore[(i) - 1])
 
 //
 // Forward declarations of miniport entry points
@@ -505,14 +608,15 @@ VOID NvmeSetupHmb(IN PHW_DEVICE_EXTENSION DevExt);
 BOOLEAN NvmeEnableHmb(IN PHW_DEVICE_EXTENSION DevExt);
 VOID NvmeFullPower(IN PHW_DEVICE_EXTENSION DevExt);
 VOID NvmeHookDeviceControl(IN PVOID DriverObject);   // nvmepdo.c (2000/XP)
+VOID NvmeHookPnp(IN PVOID DriverObject);             // nvmepdo.c (2000/XP)
 BOOLEAN NvmeSanitizeController(IN PHW_DEVICE_EXTENSION DevExt);
 BOOLEAN NvmeInitializeController(IN PHW_DEVICE_EXTENSION DevExt);
 VOID NvmeEnableInterrupts(IN PHW_DEVICE_EXTENSION DevExt);
 VOID NvmeProcessGetLogPageCompletion(IN PHW_DEVICE_EXTENSION DevExt, IN USHORT status, USHORT commandId);
 BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt);
 VOID NvmeRingDoorbell(IN PHW_DEVICE_EXTENSION DevExt, IN USHORT QueueId, IN BOOLEAN IsSubmission, IN USHORT Value);
-BOOLEAN NvmeCreateIoCQ(IN PHW_DEVICE_EXTENSION DevExt);
-BOOLEAN NvmeCreateIoSQ(IN PHW_DEVICE_EXTENSION DevExt);
+BOOLEAN NvmeCreateIoQueues(IN PHW_DEVICE_EXTENSION DevExt);
+VOID NvmeResetIoQueues(IN PHW_DEVICE_EXTENSION DevExt, IN BOOLEAN Clear);
 int NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN PNVME_COMMAND Cmd, IN USHORT CommandId);
 USHORT NvmeBuildCommandId(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb);
 USHORT NvmeBuildFlushCommandId(IN PSCSI_REQUEST_BLOCK Srb);
@@ -586,7 +690,14 @@ PHYSICAL_ADDRESS GetPrpListPagePhysical(IN PHW_DEVICE_EXTENSION DevExt, IN UCHAR
 //
 // Uncached memory allocator
 //
+#ifdef NVMENT_W9X
+VOID NvmeCaptureBiosQueue(IN PHW_DEVICE_EXTENSION DevExt);
+#endif
 BOOLEAN AllocateUncachedMemory(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Size, IN ULONG Alignment,
                                OUT PVOID* VirtualAddress, OUT PHYSICAL_ADDRESS* PhysicalAddress);
+
+#if !defined(NVMENT_W9X) && (_WIN32_WINNT >= 0x500)
+extern BOOLEAN g_NvmeNt6;                   /* nvmepdo.c: Vista and later */
+#endif
 
 #endif // _NVMENT_H_

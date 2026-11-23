@@ -8,7 +8,7 @@ BUILD_TYPE=block
 INCLUDE =.;..;$(INCLUDE)
 
 DEVICE          = nvment9x
-OBJS            = nvmemain.obj nvmecmd.obj nvmesatl.obj nvmeutil.obj nvmecpl.obj
+OBJS            = nvmemain.obj nvmecmd.obj nvmesatl.obj nvmeutil.obj nvmecpl.obj nvmevmd.obj
 
 ######### Definitions for the debug level #########
 
@@ -69,6 +69,10 @@ nvmesatl.obj: ..\nvmesatl.c ..\nvment.h ..\nvme.h
 nvmeutil.obj: ..\nvmeutil.c ..\nvment.h ..\nvme.h
 	set CL=$(CFLAGS)
 	$(CL) -Fonvmeutil.obj ..\nvmeutil.c
+
+nvmevmd.obj: ..\nvmevmd.c ..\nvment.h ..\vmdcore.h
+	set CL=$(CFLAGS)
+	$(CL) -Fonvmevmd.obj ..\nvmevmd.c
 
 nvmecpl.obj: ..\nvmecpl.c ..\nvment.h ..\nvme.h
 	set CL=$(CFLAGS)

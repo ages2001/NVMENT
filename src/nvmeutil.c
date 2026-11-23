@@ -872,6 +872,11 @@ UCHAR ReadPciConfigByte(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset)
 {
     ULONG buffer[64];
 
+    if (DevExt->VmdChildCfg != NULL) {
+        // behind an Intel VMD: the domain's configuration space (nvmevmd.c)
+        ULONG v = ScsiPortReadRegisterUlong((PULONG)(DevExt->VmdChildCfg + (Offset & ~3UL)));
+        return (UCHAR)(v >> ((Offset & 3) * 8));
+    }
     memset(buffer, 0xFF, sizeof(buffer));
     GetPciConfig(DevExt, DevExt->BusNumber, DevExt->SlotNumber, buffer, 256);
     return ((PUCHAR)buffer)[Offset];
@@ -884,6 +889,11 @@ USHORT ReadPciConfigWord(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset)
 {
     ULONG buffer[64];
 
+    if (DevExt->VmdChildCfg != NULL) {
+        // behind an Intel VMD: the domain's configuration space (nvmevmd.c)
+        ULONG v = ScsiPortReadRegisterUlong((PULONG)(DevExt->VmdChildCfg + (Offset & ~3UL)));
+        return (USHORT)(v >> ((Offset & 2) * 8));
+    }
     memset(buffer, 0xFF, sizeof(buffer));
     GetPciConfig(DevExt, DevExt->BusNumber, DevExt->SlotNumber, buffer, 256);
     return *(USHORT*)&((PUCHAR)buffer)[Offset];
@@ -896,6 +906,11 @@ ULONG ReadPciConfigDword(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset)
 {
     ULONG buffer[64];
 
+    if (DevExt->VmdChildCfg != NULL) {
+        // behind an Intel VMD: the domain's configuration space (nvmevmd.c)
+        ULONG v = ScsiPortReadRegisterUlong((PULONG)(DevExt->VmdChildCfg + (Offset & ~3UL)));
+        return v;
+    }
     memset(buffer, 0xFF, sizeof(buffer));
     GetPciConfig(DevExt, DevExt->BusNumber, DevExt->SlotNumber, buffer, 256);
     return *(ULONG*)&((PUCHAR)buffer)[Offset];
@@ -908,6 +923,18 @@ ULONG ReadPciConfigDword(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset)
 //
 VOID WritePciConfigWord(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset, IN USHORT Value)
 {
+    // an Intel RST remapped NVMe controller has no configuration space:
+    // the AHCI function's is not touched (nvmevmd.c)
+    if (DevExt->RemapNoConfig) return;
+    if (DevExt->VmdChildCfg != NULL) {
+        PULONG p = (PULONG)(DevExt->VmdChildCfg + (Offset & ~3UL));
+        ULONG shift = (Offset & 2) * 8, v = ScsiPortReadRegisterUlong(p);
+        // the status register's write-1-to-clear bits stay as they are
+        if ((Offset & ~3UL) == PCI_COMMAND_OFFSET) v &= 0x0000FFFF;
+        v = (v & ~(0xFFFFUL << shift)) | ((ULONG)Value << shift);
+        ScsiPortWriteRegisterUlong(p, v);
+        return;
+    }
 #ifdef NVMENT_NT31_COMPAT
     PciSelect(DevExt->BusNumber, DevExt->SlotNumber, Offset);
     ScsiPortWritePortUshort((PUSHORT)(PCI_CONFIG_DATA_PORT + (Offset & 2)), Value);
@@ -928,6 +955,13 @@ VOID WritePciConfigWord(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset, IN USHO
 //
 VOID WritePciConfigDword(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset, IN ULONG Value)
 {
+    // an Intel RST remapped NVMe controller has no configuration space:
+    // the AHCI function's is not touched (nvmevmd.c)
+    if (DevExt->RemapNoConfig) return;
+    if (DevExt->VmdChildCfg != NULL) {
+        ScsiPortWriteRegisterUlong((PULONG)(DevExt->VmdChildCfg + (Offset & ~3UL)), Value);
+        return;
+    }
 #ifdef NVMENT_NT31_COMPAT
     PciSelect(DevExt->BusNumber, DevExt->SlotNumber, Offset);
     ScsiPortWritePortUlong((PULONG)PCI_CONFIG_DATA_PORT, Value);

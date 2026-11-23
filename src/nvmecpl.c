@@ -452,11 +452,10 @@ BOOLEAN NvmeProcessAdminCompletion(IN PHW_DEVICE_EXTENSION DevExt)
 }
 
 //
-// NvmeProcessIoCompletion - Process I/O queue completions
+// NvmeProcessIoQueue - Process the completions of one I/O queue
 //
-BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
+static BOOLEAN NvmeProcessIoQueue(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_QUEUE Queue)
 {
-    PNVME_QUEUE Queue = &DevExt->IoQueue;
     PNVME_COMPLETION cqEntry;
     BOOLEAN processed = FALSE;
     USHORT status;
@@ -493,6 +492,9 @@ BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
         }
 
         processed = TRUE;
+        if (Queue->Outstanding > 0) {
+            Queue->Outstanding--;
+        }
 
 #ifdef NVMENT_DBG_EXTRA
         ScsiDebugPrint(0, "NVMENT: I/O completion found! QueueIdx=%d Phase=%d\n", queueIndex, expectedPhase);
@@ -564,36 +566,16 @@ BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
 
             // Get SRB extension for PRP list cleanup
             srbExt = (PNVME_SRB_EXTENSION)Srb->SrbExtension;
+#ifdef NVMENT_W9X
+            // A read through the bounce buffer: the data to the caller's buffer
+            if (srbExt->Bounced && status == NVME_SC_SUCCESS && DevExt->XBounce != NULL &&
+                (Srb->SrbFlags & SRB_FLAGS_DATA_IN)) {
+                memcpy(Srb->DataBuffer, DevExt->XBounce, Srb->DataTransferLength);
+            }
+#endif
 
             // Free the PRP list and metadata pages if allocated
             NvmeFreeSrbPages(DevExt, srbExt);
-
-            // Check if this was a TRIM operation that we need to restore buffer for
-            if (DevExt->TrimEnable && DevExt->TrimPattern != NULL && Srb->DataTransferLength >= 4096) {
-                PCDB cdb = (PCDB)Srb->Cdb;
-                BOOLEAN isWrite = FALSE;
-
-                // Check if this is a write operation
-                switch (cdb->CDB10.OperationCode) {
-                    case SCSIOP_WRITE6:
-                    case SCSIOP_WRITE:
-                        isWrite = TRUE;
-                        break;
-                }
-
-                // If write, check if bytes 16-4095 match TrimPattern (excluding first 16 bytes we corrupted)
-                if (isWrite && Srb->DataBuffer) {
-                    PUCHAR dataBuffer = (PUCHAR)Srb->DataBuffer;
-                    // Compare bytes 16-4095 with TrimPattern offset by 4 ULONGs (16 bytes)
-                    if (memcmp(dataBuffer + 16, (PUCHAR)DevExt->TrimPattern + 16, 4096 - 16) == 0) {
-                        // This was a TRIM operation - restore the first 16 bytes from TrimPattern
-#ifdef NVMENT_DBG_EXTRA
-                        ScsiDebugPrint(0, "NVMENT: Restoring first 16 bytes of TRIM buffer\n");
-#endif
-                        memcpy(dataBuffer, DevExt->TrimPattern, 16);
-                    }
-                }
-            }
 
             // Set SRB status based on NVMe status
             if (status == NVME_SC_SUCCESS) {
@@ -634,5 +616,21 @@ BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
         NvmeRingDoorbell(DevExt, Queue->QueueId, FALSE, (USHORT)(Queue->CompletionQueueHead & Queue->QueueSizeMask));
     }
 
+    return processed;
+}
+
+//
+// NvmeProcessIoCompletion - Process the completions of every I/O queue
+//
+BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
+{
+    BOOLEAN processed = FALSE;
+    ULONG i, count = DevExt->IoQueueCount ? DevExt->IoQueueCount : 1;
+
+    for (i = 0; i < count; i++) {
+        if (NvmeProcessIoQueue(DevExt, NvmeIoQueue(DevExt, i))) {
+            processed = TRUE;
+        }
+    }
     return processed;
 }

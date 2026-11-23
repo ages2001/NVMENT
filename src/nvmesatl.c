@@ -463,24 +463,21 @@ BOOLEAN ScsiHandleInquiry(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK
         inquiryData[6] = 0x00;  // No special features
         inquiryData[7] = 0x02;  // CmdQue = 1 (supports tagged command queuing)
 
-        // Vendor Identification (8 bytes) - Extract first 8 chars from model number
-        // Skip leading spaces in model number
+        // NVM Express SCSI Translation Reference: VENDOR IDENTIFICATION "NVMe",
+        // PRODUCT IDENTIFICATION the first 16 characters of the model number
+        // (as stornvme.sys; tools such as CrystalDiskInfo tell an NVMe disk
+        // by this vendor)
+        inquiryData[8] = 'N';
+        inquiryData[9] = 'V';
+        inquiryData[10] = 'M';
+        inquiryData[11] = 'e';
+        for (j = 4; j < 8; j++) {
+            inquiryData[8 + j] = ' ';
+        }
         i = 0;
         while (i < 40 && DevExt->ControllerModelNumber[i] == ' ') {
             i++;
         }
-
-        // Copy up to 8 characters for vendor field
-        for (j = 0; j < 8 && i < 40 && DevExt->ControllerModelNumber[i] != 0; j++, i++) {
-            inquiryData[8 + j] = DevExt->ControllerModelNumber[i];
-        }
-        // Pad with spaces if needed
-        while (j < 8) {
-            inquiryData[8 + j] = ' ';
-            j++;
-        }
-
-        // Product Identification (16 bytes) - Continue from model number
         for (j = 0; j < 16 && i < 40 && DevExt->ControllerModelNumber[i] != 0; j++, i++) {
             inquiryData[16 + j] = DevExt->ControllerModelNumber[i];
         }
@@ -737,7 +734,7 @@ BOOLEAN ScsiHandleReadWrite(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLO
         // Command submitted successfully, mark SRB as pending.
         return ScsiPending(DevExt, Srb, 
             DevExt->CurrentPrpListPagesUsed < (ULONG)(DevExt->SgListPages)
-            || DevExt->CurrentQueueDepth >= NVME_MAX_QUEUE_SIZE);
+            && DevExt->CurrentQueueDepth < DevExt->IoCapacity);
     } else {
         // Submission failed, likely a full queue. Free resources and mark as busy.
         NvmeFreeSrbPages(DevExt, srbExt);
@@ -1795,12 +1792,18 @@ BOOLEAN HandleIO_NVMENT(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK S
             ScsiDebugPrint(0, "NVMENT: NVMENT QUERY_INFO\n");
 #endif
             // Optional NVMENT_INFO after the header (older callers send none)
-            if (srbControl->Length >= sizeof(NVMENT_INFO) &&
-                Srb->DataTransferLength >= sizeof(SRB_IO_CONTROL) + sizeof(NVMENT_INFO)) {
+            if (srbControl->Length >= NVMENT_INFO_SIZE_V1 &&
+                Srb->DataTransferLength >= sizeof(SRB_IO_CONTROL) + NVMENT_INFO_SIZE_V1) {
                 PNVMENT_INFO info = (PNVMENT_INFO)((PUCHAR)Srb->DataBuffer + sizeof(SRB_IO_CONTROL));
+                BOOLEAN full = (BOOLEAN)(srbControl->Length >= sizeof(NVMENT_INFO) &&
+                                         Srb->DataTransferLength >= sizeof(SRB_IO_CONTROL) + sizeof(NVMENT_INFO));
                 ULONG l;
 
-                memset(info, 0, sizeof(NVMENT_INFO));
+                memset(info, 0, full ? sizeof(NVMENT_INFO) : NVMENT_INFO_SIZE_V1);
+                if (full) {
+                    info->IoQueues = DevExt->IoQueueCount;
+                    info->IoQueueEntries = DevExt->IoQueue.QueueSize;
+                }
                 info->Version = NVMENT_DRIVER_VERSION;
                 info->NvmeVersion = DevExt->Version;
                 info->Flags = (DevExt->PollMode ? NVMENT_INFO_POLLING : 0) |
@@ -1867,7 +1870,9 @@ BOOLEAN HandleIO_NVMENT(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK S
                 4096
             );
 
-            // Enable TRIM mode
+            // Enable TRIM mode, counts from zero
+            DevExt->TrimmedBytes[0] = DevExt->TrimmedBytes[1] = 0;
+            DevExt->TrimWrittenBytes[0] = DevExt->TrimWrittenBytes[1] = 0;
             DevExt->TrimEnable = TRUE;
 
 #ifdef NVMENT_DBG
@@ -1884,6 +1889,33 @@ BOOLEAN HandleIO_NVMENT(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK S
                 slot.u.AsULONG = DevExt->SlotNumber;
                 *(PULONG)((PUCHAR)Srb->DataBuffer + sizeof(SRB_IO_CONTROL)) =
                     (DevExt->BusNumber << 16) | (slot.u.bits.DeviceNumber << 8) | slot.u.bits.FunctionNumber;
+                srbControl->ReturnCode = 0;
+            } else {
+                srbControl->ReturnCode = 1;
+            }
+            Srb->SrbStatus = SRB_STATUS_SUCCESS;
+            return TRUE;
+
+        case NVMENT_IOCTL_TRIM_STATUS:
+            if (srbControl->Length >= sizeof(NVMENT_TRIM_STATUS) &&
+                Srb->DataTransferLength >= sizeof(SRB_IO_CONTROL) + sizeof(NVMENT_TRIM_STATUS)) {
+                PNVMENT_TRIM_STATUS st = (PNVMENT_TRIM_STATUS)((PUCHAR)Srb->DataBuffer + sizeof(SRB_IO_CONTROL));
+                ULONG index = (ULONG)st->TargetId * NVMENT_LUNS_PER_TARGET + st->Lun;
+
+                st->Flags = (UCHAR)(DevExt->TrimEnable ? NVMENT_TRIM_STATUS_MODE_ON : 0);
+                st->BlockSize = 0;
+                if (st->PathId == 0 && st->Lun < NVMENT_LUNS_PER_TARGET && index < NVMENT_MAX_LUNS &&
+                    DevExt->Luns[index].NamespaceId != 0) {
+                    st->Flags |= NVMENT_TRIM_STATUS_PRESENT;
+                    if ((DevExt->Oncs & NVME_ONCS_DSM) && DevExt->TrimPattern != NULL) {
+                        st->Flags |= NVMENT_TRIM_STATUS_CAN_TRIM;
+                    }
+                    st->BlockSize = DevExt->Luns[index].BlockSize;
+                }
+                st->TrimmedLow = DevExt->TrimmedBytes[0];
+                st->TrimmedHigh = DevExt->TrimmedBytes[1];
+                st->WrittenLow = DevExt->TrimWrittenBytes[0];
+                st->WrittenHigh = DevExt->TrimWrittenBytes[1];
                 srbControl->ReturnCode = 0;
             } else {
                 srbControl->ReturnCode = 1;

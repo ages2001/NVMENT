@@ -10,7 +10,7 @@ Signature="$CHICAGO$"
 Class=SCSIAdapter
 ClassGUID={4D36E97B-E325-11CE-BFC1-08002BE10318}
 Provider=%ProviderString%
-DriverVer=11/02/2026,3.2.0.0
+DriverVer=11/09/2026,3.3.0.0
 
 [DestinationDirs]
 DefaultDestDir = 12
@@ -26,6 +26,20 @@ nvment9x.mpd = 1
 
 [NVMe_Models]
 %NVMe.DeviceDesc% = NVMe_Inst, PCI\CC_010802
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_201D
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_28C0
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_28C1
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_467F
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_4C3D
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_A77F
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_7D0B
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_AD0B
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_9A0B
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_B60B
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_B06F
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_B07F
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_D70B
+%NVMe.DeviceDesc% = NVMe_Inst, PCI\VEN_8086&DEV_D73B
 
 [NVMe_Inst]
 CopyFiles = NVMe_CopyFiles

@@ -24,5 +24,6 @@ SOURCES=..\nvmemain.c \
         ..\nvmecmd.c  \
         ..\nvmesatl.c \
         ..\nvmeutil.c \
+        ..\nvmevmd.c \
         ..\nvmepdo.c  \
         ..\nvment.rc
