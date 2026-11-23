@@ -1,6 +1,6 @@
-# NVMENT — NVMe Driver for Windows 95/98/Me and Windows NT 3.1 to XP x64
+# NVMENT — NVMe Driver for Windows 95/98/Me and Windows NT 3.1 to 7 x64
 
-**NVMENT** is a SCSI miniport driver for NVMe SSDs. It lets Windows 95, 98 and Me, Windows NT 3.1, 3.50, 3.51 and 4.0, and Windows 2000, XP and Server 2003 (x86 and x64, also Alpha AXP) install on, boot from and use NVMe drives — a storage interface that did not exist when these systems were written.
+**NVMENT** is a SCSI miniport driver for NVMe SSDs. It lets Windows 95, 98 and Me, Windows NT 3.1, 3.50, 3.51 and 4.0, and Windows 2000, XP, Server 2003, Vista and 7 (x86 and x64, also Alpha AXP) install on, boot from and use NVMe drives — a storage interface that did not exist when these systems were written.
 
 > **NVMENT is based on [nvme2k](https://github.com/techomancer/nvme2k) by DominBear (Dominik Behr).** It continues nvme2k 1.5 under a new name, with the source layout of its sibling drivers AHCINT, IDENT and MMCSDNT, a Windows 9x build and the additions listed in the [version history](#version-history). The original copyright and the 3-Clause BSD license are kept.
 
